@@ -1,0 +1,4060 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Claude x Codex x CodeBuddy 群聊中枢（可扩展模型）
+
+- 统一窗口：浏览器网页群聊，所有成员发言汇进同一条时间线
+- 定向/广播：发给全体，或只跟某一方说话
+- 自动触发：@成员 让被点名方自动起一轮，接力协作
+- 模型管理：随时添加 OpenAI 风格 / Anthropic 风格的自定义模型，可停用、可删除
+- 旁听 ClaudeLink：nexus.db 里的 MCP 消息同步显示到同一个窗口
+"""
+
+import json
+import os
+import queue
+import re
+import shutil
+import atexit
+import hashlib
+import ctypes
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HUB_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HUB_DIR, "config.json")
+DB_PATH = os.path.join(HUB_DIR, "hub.db")
+WEB_DIR = os.path.join(HUB_DIR, "web")
+
+# --- GET /api/file 的拒绝表（§27 文件直链）---------------------------------
+# 白名单规则（2026-09-26 复核，与实现一致）：
+#   trace.file_roots 非空 → 只放行 realpath 落在这几个根里的路径；
+#   trace.file_roots 为空/缺失 → 默认根 = 中枢目录 + workspace.cwd（不是"全盘放行"）。
+# 无论走哪个白名单，下面这张拒绝表始终生效（凭据/数据库/密钥一类永不直链）。
+FILE_DENY_PARTS = {".git", ".ssh", ".aws", ".gnupg", "__pycache__", "node_modules"}
+FILE_DENY_NAMES = {"hub.db", "hub.db-wal", "hub.db-shm", "id_rsa", "id_ed25519",
+                   "id_ecdsa", ".env", ".netrc", "credentials"}
+FILE_DENY_EXTS = {".db", ".sqlite", ".sqlite3", ".key", ".pem", ".pfx", ".p12", ".jks"}
+FILE_MAX_BYTES = 512 * 1024
+HUB_SENSITIVE = {os.path.join(os.path.realpath(HUB_DIR), n) for n in
+                 ("config.json", "hub.db", "hub.db-wal", "hub.db-shm", "hub.errors.log")}
+
+def legacy_ts_to_ms(ts):
+    """老表（messages.ts / perm_requests.ts，REAL 秒）→ 毫秒整数。
+
+    §7.1：全库唯一允许出现 `*1000` 的地方。跨表比较/断言一律调它，禁止内联乘 1000。
+    """
+    return round(ts * 1000)
+
+
+def now_ms():
+    """新表（turns/steps）取当前时刻的唯一入口，复用 legacy_ts_to_ms。"""
+    return legacy_ts_to_ms(time.time())
+
+
+BOOT_MS = now_ms()              # 进程启动时刻（UTC 毫秒），§7.4 启动自愈的分界
+MENTION_RE = re.compile(r"@([A-Za-z0-9_\-]+)")
+PERM_RE = re.compile(r"\[\[\s*PERM\s+(rw|ro)\s+([^|\]]+?)(?:\|([^\]]*))?\s*\]\]", re.IGNORECASE)
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+STYLES = ("anthropic", "openai")
+
+
+def load_config():
+    with open(CONFIG_PATH, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+CONFIG = load_config()
+CONFIG_LOCK = threading.Lock()
+
+# 新 schema 是嵌套的；下面这张表让老写法/手工改的扁平键也能用
+_CFG_ALIASES = {
+    "cwd": "workspace.cwd",
+    "host": "server.host",
+    "port": "server.port",
+    "turn_timeout_sec": "limits.turn_timeout_sec",
+    "max_output_chars": "limits.max_output_chars",
+    "history_limit": "context.history_limit",
+    "memory_mode": "context.memory_mode",
+    "shared_context": "context.shared_context",
+    "nexus_mirror": "claudelink.mirror",
+    "activity_bar": "ui.activity_bar",
+    "streaming": "streaming",
+    "relay": "relay",
+    "permissions": "permissions",
+}
+
+
+def _dig(data, dotted, default=None):
+    node = data
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def cfg_get(key, default=None):
+    """先按新嵌套路径取，再退回老的扁平键。"""
+    dotted = _CFG_ALIASES.get(key, key)
+    value = _dig(CONFIG, dotted, None)
+    if value is None:
+        value = CONFIG.get(key, None)
+    return default if value is None else value
+
+
+def cfg_agent(name):
+    """CLI 成员取 agents.<name>，自定义 API 模型取 model_overrides.<name>。"""
+    node = CONFIG.get("agents", {}).get(name)
+    if isinstance(node, dict):
+        return node
+    node = CONFIG.get("model_overrides", {}).get(name)
+    return node if isinstance(node, dict) else {}
+
+
+def turn_timeout(agent=None):
+    """单轮超时（秒）；0 或负数 = 无上限。成员级 settings 优先于全局。"""
+    if agent:
+        per = cfg_agent(agent).get("turn_timeout_sec")
+        if per is not None and per != "":
+            try:
+                value = int(per)
+                return 0 if value <= 0 else value
+            except (TypeError, ValueError):
+                pass
+    try:
+        value = int(cfg_get("limits.turn_timeout_sec", 1800) or 0)
+    except (TypeError, ValueError):
+        return 1800
+    return 0 if value <= 0 else value
+
+
+def http_timeout(agent=None):
+    """HTTP 调用超时；无上限时给 None（urllib 语义：阻塞到返回）。"""
+    value = turn_timeout(agent)
+    return None if value == 0 else value
+
+
+def save_config():
+    """把内存里的配置写回 config.json（原子替换）。"""
+    with CONFIG_LOCK:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(CONFIG, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+
+
+def reload_config():
+    global CONFIG, BUILTIN, LABELS, DEFAULT_CWD
+    CONFIG = load_config()
+    BUILTIN = list(CONFIG.get("agents", {}).keys())
+    LABELS = {k: v.get("label", k) for k, v in CONFIG.get("agents", {}).items()}
+    DEFAULT_CWD = cfg_get("cwd") or HUB_DIR
+
+
+BUILTIN = list(CONFIG["agents"].keys())
+LABELS = {k: v.get("label", k) for k, v in CONFIG["agents"].items()}
+DEFAULT_CWD = cfg_get("cwd") or HUB_DIR      # 读 workspace.cwd（不是旧的扁平键 cwd）
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9\-]+", "-", (text or "").strip().lower()).strip("-")
+
+
+# --------------------------------------------------------------------- trace 工具
+# now_ms / legacy_ts_to_ms / BOOT_MS 定义在文件顶部（BOOT_MS 要在导入时就取样）
+def trace_cfg():
+    return cfg_get("trace", {}) or {}
+
+
+def trace_enabled():
+    return bool(trace_cfg().get("enabled", True))
+
+
+ERROR_LOG = os.path.join(HUB_DIR, "hub.errors.log")
+
+
+def log_agent_error(label, exc=None, prompt="", live=None):
+    """把成员轮次的异常和现场写进 hub.errors.log（threading.excepthook 也用它）。"""
+    try:
+        import traceback as _tb
+
+        with open(ERROR_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {label} ===\n")
+            fh.write(f"prompt 长度: {len(prompt or '')}\n")
+            tail = "".join(live or [])[-400:]
+            if tail:
+                fh.write(f"最后输出: {tail}\n")
+            if exc is not None:
+                fh.write(f"{type(exc).__name__}: {exc}\n")
+            fh.write(_tb.format_exc())
+    except Exception:
+        pass
+
+
+def _thread_excepthook(args):
+    try:
+        name = args.thread.name if getattr(args, "thread", None) else "?"
+    except Exception:
+        name = "?"
+    log_agent_error(f"thread:{name}", getattr(args, "exc_value", None))
+
+
+def trace_capture_prompt():
+    return bool(trace_cfg().get("capture_prompt", False))
+
+
+def detail_max_bytes():
+    try:
+        return max(256, int(trace_cfg().get("detail_max_bytes", 8192)))
+    except (TypeError, ValueError):
+        return 8192
+
+
+def _clip_text(text, limit):
+    """按 UTF-8 字节截到 limit 以内，截断点落在合法 UTF-8 边界。"""
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    keep = raw[:limit].decode("utf-8", "ignore")
+    return keep + f"…（截断，共 {len(raw)} 字节）"
+
+
+def _clip_value(value, limit):
+    if isinstance(value, str):
+        return _clip_text(value, limit)
+    if isinstance(value, dict):
+        return {k: _clip_value(v, limit) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clip_value(v, limit) for v in value]
+    return value
+
+
+def fit_detail(obj, limit=None):
+    """把任意对象变成恒为 JSON 对象的字符串，超限时按字节截断并保留结构（§6）。"""
+    limit = limit or detail_max_bytes()
+    per_value = max(64, limit // 2)
+    try:
+        body = json.dumps(_clip_value(obj, per_value), ensure_ascii=False, default=str)
+    except Exception:
+        body = "{}"
+    raw = body.encode("utf-8")
+    if len(raw) <= limit:
+        return body
+    head = _clip_text(body, max(64, limit // 4))
+    out = {
+        "truncated": True,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest()[:32],
+        "preview": head,
+    }
+    text = json.dumps(out, ensure_ascii=False)
+    while len(text.encode("utf-8")) > limit and out["preview"]:
+        out["preview"] = out["preview"][: len(out["preview"]) // 2]
+        text = json.dumps(out, ensure_ascii=False)
+    return text
+
+
+# --- tool 入参 → 前端可渲染结构（§27）--------------------------------------
+# 截图要的三样：Edit 的红绿 diff、Bash 的命令块、Read/Write 的文件直链。
+# 三样在 tool_use 的入参里本来就都有，缺的只是**采集**和**规整**。
+FILE_ARG_KEYS = ("file_path", "path", "notebook_path", "filePath", "abs_path", "target_file")
+EDIT_OLD_KEYS = ("old_string", "old_str", "oldText")
+EDIT_NEW_KEYS = ("new_string", "new_str", "newText")
+WRITE_TEXT_KEYS = ("content", "contents", "file_text", "text")
+
+
+def _parse_tool_json(raw):
+    """拼回 tool_use 的流式入参。content_block_start 时 input 还是 {}，
+    真值在 content_block_delta 的 partial_json 里逐片到达 —— 不拼就是空入参。"""
+    if not raw:
+        return None
+    try:
+        got = json.loads(raw)
+    except Exception:
+        return {"_raw": _clip_text(raw, 2048)}
+    return got if isinstance(got, dict) else {"_value": got}
+
+
+def tool_detail(name, raw, output=None, budget=None):
+    """把 tool 入参规整成前端可直接渲染的结构，**每个字段单独截断**。
+
+    为什么不是整条交给 `fit_detail`：8KB 是整条 detail 的上限，一个稍大的 diff
+    就能把结构挤成 `{truncated, preview}` 字符串，前端从此拿不到 old/new 的边界，
+    红绿渲染就没了。所以这里先把每个字段压到 1/3 预算，保住结构；全文靠
+    `GET /api/file` 直链读盘（§6 的截断上限不因此作废）。
+    """
+    budget = budget or max(512, detail_max_bytes() // 3)
+    raw = raw if isinstance(raw, dict) else {}
+    d = {"tool": (name or "").strip()}
+    clipped = False
+
+    def put(key, value):
+        nonlocal clipped
+        if not isinstance(value, str) or not value:
+            return
+        got = _clip_text(value, budget)
+        if got != value:
+            clipped = True
+        d[key] = got
+
+    for key in FILE_ARG_KEYS:
+        if isinstance(raw.get(key), str) and raw[key]:
+            put("path", raw[key])
+            break
+    cmd = raw.get("command")
+    if isinstance(cmd, (list, tuple)):
+        cmd = " ".join(str(part) for part in cmd)
+    if isinstance(cmd, str) and cmd.strip():
+        put("command", cmd)
+    for key in EDIT_OLD_KEYS:
+        if isinstance(raw.get(key), str):
+            put("old_text", raw[key])
+            break
+    for key in EDIT_NEW_KEYS:
+        if isinstance(raw.get(key), str):
+            put("new_text", raw[key])
+            break
+    if "new_text" not in d:                      # Write 类：整文件内容当新增
+        for key in WRITE_TEXT_KEYS:
+            if isinstance(raw.get(key), str):
+                put("new_text", raw[key])
+                break
+    for key in ("pattern", "query", "description"):
+        if isinstance(raw.get(key), str) and raw[key].strip():
+            put(key, raw[key])
+            break
+    # codex 的 fileChange 给的是**统一 diff**（带 @@ 段号），比 old/new 更好渲染：
+    # 直接按行首 +/-/空格 上色就是截图里的样子，不需要前端再算 diff。
+    changes = raw.get("changes")
+    if isinstance(changes, list) and changes and isinstance(changes[0], dict):
+        first = changes[0]
+        if "path" not in d:
+            put("path", first.get("path"))
+        put("diff_text", first.get("diff"))
+        if len(changes) > 1:
+            d["files"] = len(changes)
+    put("output", output)
+    if clipped:
+        d["clipped"] = True
+    if len(d) <= 1:                              # 只有工具名 = 没有可渲染的东西
+        return None                              # 返回 None，别把已有 detail 覆盖成空壳
+    return d
+
+
+# --------------------------------------------------------------------------- store
+class Store:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        # agent -> 最近一次 open_turn 的 turn_id（§4.3 权限 step 挂靠用）。
+        # 只在 open_turn 里写，不在 _run_agent 的 finally 里清 ——
+        # 权限申请是在 finally 之后才落库的，靠 running[agent] 永远拿不到。
+        self.last_turn = {}
+        self.con = sqlite3.connect(path, check_same_thread=False)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS messages(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   ts REAL, sender TEXT, target TEXT, kind TEXT,
+                   text TEXT, ref TEXT)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS sessions(
+                   agent TEXT PRIMARY KEY, session_id TEXT, updated_at REAL)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS models(
+                   id TEXT PRIMARY KEY, label TEXT, style TEXT, base_url TEXT,
+                   api_key TEXT, model TEXT, system_prompt TEXT, path TEXT,
+                   max_tokens INTEGER DEFAULT 1024, enabled INTEGER DEFAULT 1,
+                   created_at REAL)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS api_history(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   model_id TEXT, role TEXT, content TEXT, ts REAL)"""
+        )
+        self.con.execute("CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)")
+        self.con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_ref ON messages(ref) WHERE ref IS NOT NULL"
+        )
+        self.con.commit()
+        self._migrate()
+
+    def _migrate(self):
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(models)")}
+        if "path" not in cols:
+            self.con.execute("ALTER TABLE models ADD COLUMN path TEXT")
+            self.con.commit()
+        mcols = {r[1] for r in self.con.execute("PRAGMA table_info(messages)")}
+        if "display_text" not in mcols:
+            self.con.execute("ALTER TABLE messages ADD COLUMN display_text TEXT")
+        if "retry_agent" not in mcols:
+            self.con.execute("ALTER TABLE messages ADD COLUMN retry_agent TEXT")
+        if "retry_prompt" not in mcols:
+            self.con.execute("ALTER TABLE messages ADD COLUMN retry_prompt TEXT")
+        if "highlight" not in mcols:
+            self.con.execute("ALTER TABLE messages ADD COLUMN highlight INTEGER DEFAULT 0")
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS nexus_agents(
+                   id TEXT PRIMARY KEY, role TEXT, first_seen REAL, last_seen REAL)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS highlights(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   message_id INTEGER, start INTEGER, end INTEGER, text TEXT, ts REAL)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS grants(
+                   agent TEXT, path TEXT, mode TEXT, ts REAL,
+                   PRIMARY KEY(agent, path))"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS perm_requests(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   agent TEXT, path TEXT, mode TEXT, reason TEXT,
+                   status TEXT, ts REAL, resolved_ts REAL)"""
+        )
+        # 已处理过的外部引用（ClaudeLink 镜像），清空消息后仍保留，避免旧消息被重新贴一遍
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS seen_refs(ref TEXT PRIMARY KEY, ts REAL)"""
+        )
+        # §4.3：权限申请要挂在「提出它的那个 turn」上。perm_request 是在 _run_agent 的
+        # finally 之后才落库的，实时状态那时已失效，只能靠落库时写死的 turn_id 回查。
+        pcols = {r[1] for r in self.con.execute("PRAGMA table_info(perm_requests)")}
+        if "turn_id" not in pcols:
+            self.con.execute("ALTER TABLE perm_requests ADD COLUMN turn_id TEXT")
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS attachments(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name TEXT, rel TEXT, path TEXT, kind TEXT, size INTEGER,
+                   text TEXT, ts REAL, message_id INTEGER)"""
+        )
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_hl_msg ON highlights(message_id)")
+        # -- trace：turns / steps（§3，单位 UTC 毫秒）-------------------------
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS turns(
+                   id             TEXT PRIMARY KEY,
+                   trace_id       TEXT NOT NULL,
+                   parent_turn_id TEXT,
+                   agent          TEXT NOT NULL,
+                   depth          INTEGER NOT NULL DEFAULT 0,
+                   trigger_kind   TEXT NOT NULL,
+                   trigger_msg_id INTEGER,
+                   trigger_by     TEXT,
+                   reply_msg_id   INTEGER,
+                   model          TEXT,
+                   session_id     TEXT,
+                   start_ts       INTEGER NOT NULL,
+                   end_ts         INTEGER,
+                   status         TEXT NOT NULL,
+                   error_text     TEXT,
+                   in_tokens      INTEGER NOT NULL DEFAULT 0,
+                   out_tokens     INTEGER NOT NULL DEFAULT 0,
+                   usage_source   TEXT NOT NULL DEFAULT 'estimated',
+                   in_chars       INTEGER NOT NULL DEFAULT 0,
+                   out_chars      INTEGER NOT NULL DEFAULT 0)"""
+        )
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS steps(
+                   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                   turn_id    TEXT NOT NULL,
+                   seq        INTEGER NOT NULL,
+                   kind       TEXT NOT NULL,
+                   name       TEXT,
+                   status     TEXT NOT NULL,
+                   start_ts   INTEGER NOT NULL,
+                   end_ts     INTEGER,
+                   in_tokens  INTEGER,
+                   out_tokens INTEGER,
+                   detail     TEXT)"""
+        )
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_turns_trace  ON turns(trace_id, start_ts)")
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent  ON turns(agent, start_ts DESC)")
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_turns_parent ON turns(parent_turn_id)")
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_steps_turn   ON steps(turn_id, seq)")
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_turns_open ON turns(status) WHERE status='running'"
+        )
+        self.con.commit()
+
+    # -- messages -----------------------------------------------------------
+    def add_message(self, sender, target, kind, text, ref=None, retry_agent=None,
+                    retry_prompt=None, display_text=None):
+        with self.lock:
+            cur = self.con.execute(
+                """INSERT OR IGNORE INTO messages(
+                       ts,sender,target,kind,text,ref,retry_agent,retry_prompt,display_text)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (time.time(), sender, target, kind, text, ref, retry_agent, retry_prompt, display_text),
+            )
+            self.con.commit()
+            if cur.rowcount == 0:
+                return None
+            row_id = cur.lastrowid
+        return self.get(row_id)
+
+    def get(self, row_id):
+        with self.lock:
+            row = self.con.execute(
+                """SELECT id,ts,sender,target,kind,text,ref,retry_agent,retry_prompt,highlight,display_text
+                     FROM messages WHERE id=?""",
+                (row_id,),
+            ).fetchone()
+        out = self._row2(row) if row else None
+        if out:
+            out["highlights"] = self.list_highlights(out["id"])
+            out["attachments"] = [
+                {"id": a["id"], "name": a["name"], "kind": a["kind"], "size": a["size"]}
+                for a in self.attachments_for_message(out["id"])
+            ]
+        return out
+
+    @staticmethod
+    def _row(row):
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "ts": row[1],
+            "sender": row[2],
+            "target": row[3],
+            "kind": row[4],
+            "text": row[5],
+            "ref": row[6],
+            "retry_agent": row[7],
+            "retry_prompt": row[8],
+            "can_retry": bool(row[7] and row[8]),
+            "highlight": bool(row[9]),
+        }
+
+    @staticmethod
+    def _row2(row):
+        """带 display_text 的行（recent 用）。"""
+        return {
+            "id": row[0], "ts": row[1], "sender": row[2], "target": row[3], "kind": row[4],
+            "text": row[5], "ref": row[6], "retry_agent": row[7], "retry_prompt": row[8],
+            "can_retry": bool(row[7] and row[8]), "highlight": bool(row[9]),
+            "display_text": row[10],
+        }
+
+    def recent(self, limit=300):
+        """limit=None 表示取全部（上下文不限条数时用）。"""
+        with self.lock:
+            if limit is None:
+                rows = self.con.execute(
+                    """SELECT id,ts,sender,target,kind,text,ref,retry_agent,retry_prompt,highlight,display_text
+                         FROM messages ORDER BY id"""
+                ).fetchall()
+                rows = list(rows)
+            else:
+                rows = self.con.execute(
+                    """SELECT id,ts,sender,target,kind,text,ref,retry_agent,retry_prompt,highlight,display_text
+                         FROM messages ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            att_rows = self.con.execute(
+                """SELECT id,message_id,name,kind,size FROM attachments
+                    WHERE message_id IS NOT NULL ORDER BY id"""
+            ).fetchall()
+        att_map = {}
+        for aid, mid, name, kind, size in att_rows:
+            att_map.setdefault(mid, []).append(
+                {"id": aid, "name": name, "kind": kind, "size": size}
+            )
+        ordered = list(rows) if limit is None else list(reversed(rows))
+        out = [self._row2(r) for r in ordered]
+        for item in out:
+            item["highlights"] = self.list_highlights(item["id"])
+            item["attachments"] = att_map.get(item["id"], [])
+        return out
+
+    def clear_messages(self):
+        """消息 + trace 在同一事务里清掉（§7.5）：否则消息清了、流程还留着，两边对不上。"""
+        with self.lock:
+            self.con.execute("DELETE FROM messages")
+            self.con.execute("DELETE FROM highlights")
+            self.con.execute("DELETE FROM steps")     # 先子后父（无外键也保持顺序）
+            self.con.execute("DELETE FROM turns")
+            self.con.commit()
+
+    def clear_all_sessions(self):
+        with self.lock:
+            self.con.execute("DELETE FROM sessions")
+            self.con.commit()
+
+    def clear_all_model_history(self):
+        with self.lock:
+            self.con.execute("DELETE FROM api_history")
+            self.con.commit()
+
+    def mark_ref(self, ref):
+        """返回 True 表示这个外部引用第一次见到（需要展示）。"""
+        with self.lock:
+            cur = self.con.execute(
+                "INSERT OR IGNORE INTO seen_refs(ref, ts) VALUES(?, ?)", (ref, time.time())
+            )
+            self.con.commit()
+            return cur.rowcount > 0
+
+    # -- trace（turns / steps，时间一律 UTC 毫秒）------------------------------
+    TURN_COLS = (
+        "id", "trace_id", "parent_turn_id", "agent", "depth", "trigger_kind",
+        "trigger_msg_id", "trigger_by", "reply_msg_id", "model", "session_id",
+        "start_ts", "end_ts", "status", "error_text", "in_tokens", "out_tokens",
+        "usage_source", "in_chars", "out_chars",
+    )
+    STEP_COLS = (
+        "id", "turn_id", "seq", "kind", "name", "status", "start_ts", "end_ts",
+        "in_tokens", "out_tokens", "detail",
+    )
+
+    @staticmethod
+    def _turn_row(row):
+        d = dict(zip(Store.TURN_COLS, row))
+        if d.get("status") == "running":
+            # 还没结算的 turn 没有 usage 事实可言。列上是 NOT NULL DEFAULT 'estimated'，
+            # 直接透出去会让界面把「运行中」显示成「估算 0 tokens」——真值其实已经
+            # 躺在 steps 里。语义在投影层收敛，不动 schema。
+            d["usage_source"] = None
+        return d
+
+    @staticmethod
+    def _step_row(row):
+        return dict(zip(Store.STEP_COLS, row))
+
+    @staticmethod
+    def _as_detail(detail):
+        if detail is None:
+            return "{}"
+        if isinstance(detail, str):
+            return _clip_text(detail, detail_max_bytes())
+        return fit_detail(detail)
+
+    def get_turn(self, turn_id):
+        with self.lock:
+            row = self.con.execute(
+                f"SELECT {','.join(self.TURN_COLS)} FROM turns WHERE id=?", (turn_id,)
+            ).fetchone()
+        return self._turn_row(row) if row else None
+
+    def is_turn_running(self, turn_id):
+        with self.lock:
+            row = self.con.execute(
+                "SELECT 1 FROM turns WHERE id=? AND status='running'", (turn_id,)
+            ).fetchone()
+        return bool(row)
+
+    def get_step(self, step_id):
+        with self.lock:
+            row = self.con.execute(
+                f"SELECT {','.join(self.STEP_COLS)} FROM steps WHERE id=?", (step_id,)
+            ).fetchone()
+        return self._step_row(row) if row else None
+
+    def open_turn(self, turn_id, trace_id, agent, depth=0, parent_turn_id=None,
+                  trigger_kind="user", trigger_msg_id=None, trigger_by=None,
+                  model=None, session_id=None, agent_id=None):
+        with self.lock:
+            # last_turn 的 key 必须是**路由 id**（不是显示名），权限挂靠要靠它回查
+            self.last_turn[agent_id or agent] = turn_id
+            self.con.execute(
+                """INSERT INTO turns(id,trace_id,parent_turn_id,agent,depth,trigger_kind,
+                                    trigger_msg_id,trigger_by,model,session_id,start_ts,status)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,'running')""",
+                (turn_id, trace_id, parent_turn_id, agent, depth, trigger_kind,
+                 trigger_msg_id, trigger_by, model, session_id, now_ms()),
+            )
+            self.con.commit()
+        return self.get_turn(turn_id)
+
+    # turn 终态 → 其下 running step 的收敛终态（§3.2 对照表，唯一映射，不许硬编码）
+    STEP_SETTLE = {"interrupted": "skipped", "timeout": "error", "error": "error"}
+
+    def settle_turn(self, turn_id, status, *, end_ts, reply_msg_id=None, error_text=None,
+                    in_chars=None, out_chars=None):
+        """唯一的关 turn 入口（§3.2 / §7.3）。
+
+        - `end_ts` **必填**：调用方传真实事件时刻，函数内不取 now（否则 post() 的
+          写库耗时会算进 turn 时长，用例 16 会红）。
+        - 顺序不可颠倒：先抢 turn 行（守卫就是 `rowcount`），只在拿到 rowcount==1 的
+          那一次才有权收敛 step —— 反过来写会出现「turn=interrupted，step=error」。
+        - 幂等：status 只允许从 running 迁出一次；end_ts 用 COALESCE（首次写入者胜）；
+          reply_msg_id 只在 IS NULL 时补写。
+        """
+        step_status = self.STEP_SETTLE.get(status, "error")   # ok 时残留 step 按 error 收
+        with self.lock:
+            total, with_usage = self.con.execute(
+                """SELECT COUNT(*),
+                          SUM(CASE WHEN in_tokens IS NOT NULL OR out_tokens IS NOT NULL
+                                   THEN 1 ELSE 0 END)
+                     FROM steps WHERE turn_id=? AND kind='llm_call'""",
+                (turn_id,),
+            ).fetchone()
+            if not total:
+                source = "estimated"
+            elif with_usage == total:
+                source = "provider"
+            elif with_usage:
+                source = "mixed"
+            else:
+                source = "estimated"
+            cur = self.con.execute(
+                """UPDATE turns
+                      SET end_ts=COALESCE(end_ts, ?),
+                          status=?,
+                          error_text=COALESCE(?, error_text),
+                          in_chars=COALESCE(?, in_chars),
+                          out_chars=COALESCE(?, out_chars),
+                          in_tokens=(SELECT COALESCE(SUM(in_tokens),0) FROM steps
+                                      WHERE turn_id=? AND kind='llm_call'),
+                          out_tokens=(SELECT COALESCE(SUM(out_tokens),0) FROM steps
+                                       WHERE turn_id=? AND kind='llm_call'),
+                          usage_source=?
+                    WHERE id=? AND status='running'""",
+                (end_ts, status, error_text, in_chars, out_chars,
+                 turn_id, turn_id, source, turn_id),
+            )
+            # 只有抢到 turn 行的那一次才有权收敛 step（§3.2 顺序约束）
+            if cur.rowcount == 1:
+                self.con.execute(
+                    "UPDATE steps SET status=?, end_ts=? WHERE turn_id=? AND status='running'",
+                    (step_status, end_ts, turn_id),
+                )
+            if reply_msg_id is not None:
+                self.con.execute(
+                    "UPDATE turns SET reply_msg_id=? WHERE id=? AND reply_msg_id IS NULL",
+                    (reply_msg_id, turn_id),
+                )
+            self.con.commit()
+        return self.get_turn(turn_id)
+
+    def _rollup_usage(self, turn_id):
+        """按 §5.3 从 `steps.llm_call` 求和，刷新 turn 的 usage 三列。
+
+        只动 usage 三列，**不碰 status/end_ts**，所以对已终态 turn 也安全。
+
+        与 `settle_turn` 里那段不是重复实现，别合并：`settle_turn` 的 rollup 必须
+        与 status 写进同一条带 `status='running'` 守卫的 UPDATE —— 拆开会让
+        `rowcount` 失去「只有首次关 turn 的那次才有权收敛子 step」的判别力。
+        这里走的是**关闭之后的补写**路径，没有守卫可借，也不该改状态。
+        """
+        total, with_usage = self.con.execute(
+            """SELECT COUNT(*),
+                      SUM(CASE WHEN in_tokens IS NOT NULL OR out_tokens IS NOT NULL
+                               THEN 1 ELSE 0 END)
+                 FROM steps WHERE turn_id=? AND kind='llm_call'""",
+            (turn_id,),
+        ).fetchone()
+        if not total:
+            source = "estimated"
+        elif with_usage == total:
+            source = "provider"
+        elif with_usage:
+            source = "mixed"
+        else:
+            source = "estimated"
+        self.con.execute(
+            """UPDATE turns
+                  SET in_tokens=(SELECT COALESCE(SUM(in_tokens),0) FROM steps
+                                  WHERE turn_id=? AND kind='llm_call'),
+                      out_tokens=(SELECT COALESCE(SUM(out_tokens),0) FROM steps
+                                   WHERE turn_id=? AND kind='llm_call'),
+                      usage_source=?
+                WHERE id=?""",
+            (turn_id, turn_id, source, turn_id),
+        )
+
+    def add_step(self, turn_id, kind, name=None, status="ok", detail=None,
+                 in_tokens=None, out_tokens=None):
+        payload = self._as_detail(detail)
+        now = now_ms()
+        with self.lock:
+            # §21 允许 step 晚于 turn.end_ts 落库（权限批准跨重启），但**绝不允许
+            # 停在 running**：父 turn 已终态时 `settle_turn` 不会再跑，而
+            # `settle_orphans` 只扫 `turns.status='running'` —— 一条晚到的 running
+            # step 没有任何路径会再收敛它，会成为永久呼吸动画并跨重启累积。
+            # 就地按父 turn 终态收敛（映射沿用 §3.2 的 STEP_SETTLE）。
+            row = self.con.execute(
+                "SELECT status FROM turns WHERE id=?", (turn_id,)
+            ).fetchone()
+            parent = row[0] if row else None
+            late = parent is not None and parent != "running"
+            if late and status == "running":
+                status = self.STEP_SETTLE.get(parent, "error")
+            seq = self.con.execute(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM steps WHERE turn_id=?", (turn_id,)
+            ).fetchone()[0]
+            cur = self.con.execute(
+                """INSERT INTO steps(turn_id,seq,kind,name,status,start_ts,end_ts,
+                                     in_tokens,out_tokens,detail)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (turn_id, seq, kind, name or None, status, now,
+                 None if status == "running" else now, in_tokens, out_tokens, payload),
+            )
+            # 晚到的 llm_call 也要进 rollup，否则 `turns.*_tokens != Σ steps.llm_call`
+            # 会永久不等（live 上已复现 2 条，见 §24.7）。
+            if late and kind == "llm_call":
+                self._rollup_usage(turn_id)
+            self.con.commit()
+            sid = cur.lastrowid
+        return self.get_step(sid)
+
+    def end_step(self, step_id, status="ok", detail=None, in_tokens=None, out_tokens=None):
+        payload = None if detail is None else self._as_detail(detail)
+        with self.lock:
+            self.con.execute(
+                """UPDATE steps SET status=?, end_ts=?,
+                          detail=COALESCE(?, detail),
+                          in_tokens=COALESCE(?, in_tokens),
+                          out_tokens=COALESCE(?, out_tokens)
+                     WHERE id=? AND status='running'""",
+                (status, now_ms(), payload, in_tokens, out_tokens, step_id),
+            )
+            self.con.commit()
+        return self.get_step(step_id)
+
+    def set_turn_model(self, turn_id, model):
+        """补写 turn.model —— CLI 链的模型名只有从 stream 的 message_start 里才知道。
+
+        只在为空时写（`model IS NULL`），绝不覆盖已有值：model 是「按模型聚合成本」
+        的语义位，被 agent id 兜底填过就再也修不回来了。
+        """
+        if not model:
+            return
+        with self.lock:
+            self.con.execute(
+                "UPDATE turns SET model=? WHERE id=? AND model IS NULL", (model, turn_id)
+            )
+            self.con.commit()
+
+    def set_step_usage(self, step_id, in_tokens=None, out_tokens=None):
+        """补写一次 API 调用的 usage（不改 status、不关 step）。
+
+        Claude 的 usage 分两处来：`message_start` 给 input、`message_delta` 给 output（§5.2），
+        所以是一路补写、由最后一次 `llm_end` 收口 —— COALESCE 保证「只带 output 的那次」
+        不会把已经写好的 input 抹成 NULL。
+        """
+        with self.lock:
+            self.con.execute(
+                """UPDATE steps
+                      SET in_tokens=COALESCE(?, in_tokens),
+                          out_tokens=COALESCE(?, out_tokens)
+                    WHERE id=?""",
+                (in_tokens, out_tokens, step_id),
+            )
+            self.con.commit()
+        return self.get_step(step_id)
+
+    def settle_orphans(self, boot_ms=None):
+        """收敛上次进程被强杀留下的 running（§7.4）。
+
+        保守版：只动 `start_ts` 早于本次进程启动的，避免误伤本进程里真正在跑的 turn
+        （同一个 hub.db 被两个实例打开时那会静默判死对方的活 turn）。
+        逐条走 `settle_turn` —— 连带把子 step 收成 `skipped`，不复制 UPDATE 语句。
+        """
+        edge = BOOT_MS if boot_ms is None else boot_ms
+        with self.lock:
+            ids = [r[0] for r in self.con.execute(
+                "SELECT id FROM turns WHERE status='running' AND start_ts < ?", (edge,)
+            ).fetchall()]
+        # settle_turn 自己要拿 self.lock（非可重入），所以必须在锁外逐条调用
+        for tid in ids:
+            self.settle_turn(tid, "interrupted", end_ts=edge, error_text="hub restarted")
+
+        # 存量补救：晚期版本之前 `add_step` 无父 turn 终态判断，把 step 留在 `running`
+        # 而父 turn 已终态 —— 这类行只扫 turns 覆盖不到，会跨重启累积成永久呼吸动画，
+        # 并让 rollup 永久偏离 Σ steps。这里一次性收敛 + 刷新 rollup（幂等，之后自静默）。
+        # 只打父 turn 已终态的 step，所以对另一实例正在跑的活 turn 天然无害。
+        with self.lock:
+            rows = self.con.execute(
+                """SELECT s.id, s.turn_id, t.status FROM steps s
+                     JOIN turns t ON t.id=s.turn_id
+                    WHERE s.status='running' AND t.status!='running'"""
+            ).fetchall()
+            for sid, tid, tstatus in rows:
+                self.con.execute(
+                    "UPDATE steps SET status=?, end_ts=COALESCE(end_ts, ?) WHERE id=?",
+                    (self.STEP_SETTLE.get(tstatus, "error"), edge, sid),
+                )
+            # 终态 turn 的 usage 三列按 Σ steps 重算一次：rollup 只在 settle_turn 里写，
+            # 任何「关闭之后才到」的 step 都会让它永久偏离（§24.7，live 上 2 条）。
+            # `_rollup_usage` 只动 usage 三列、不碰状态，所以对终态 turn 安全；
+            # 启动时全量一遍即收敛为 0 条差异，后续每次启动都是空转。
+            for (tid,) in self.con.execute(
+                    "SELECT id FROM turns WHERE status!='running'").fetchall():
+                self._rollup_usage(tid)
+            self.con.commit()
+        return len(ids)
+
+    def trace_list(self, limit=50):
+        with self.lock:
+            rows = self.con.execute(
+                """SELECT trace_id, MIN(start_ts), MAX(COALESCE(end_ts, start_ts)),
+                          COUNT(*),
+                          SUM(CASE WHEN status='running' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status IN ('error','timeout') THEN 1 ELSE 0 END),
+                          MIN(trigger_msg_id), GROUP_CONCAT(DISTINCT agent)
+                     FROM turns GROUP BY trace_id
+                    ORDER BY MIN(start_ts) DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        out = []
+        for tid, started, ended, count, running, failed, root_msg, agents in rows:
+            out.append({
+                "trace_id": tid,
+                "started": started,
+                "ended": ended,
+                "turn_count": count,
+                "agents": [a for a in (agents or "").split(",") if a],
+                "status": "running" if running else ("error" if failed else "ok"),
+                "root_msg_id": root_msg,
+            })
+        return out
+
+    def trace_detail(self, trace_id):
+        with self.lock:
+            turns = self.con.execute(
+                f"SELECT {','.join(self.TURN_COLS)} FROM turns WHERE trace_id=? ORDER BY start_ts, id",
+                (trace_id,),
+            ).fetchall()
+            if not turns:
+                return None
+            steps = self.con.execute(
+                f"""SELECT {','.join(self.STEP_COLS)} FROM steps
+                     WHERE turn_id IN (SELECT id FROM turns WHERE trace_id=?)
+                     ORDER BY turn_id, seq""",
+                (trace_id,),
+            ).fetchall()
+        grouped = {}
+        for row in steps:
+            grouped.setdefault(row[1], []).append(self._step_row(row))
+        return {"turns": [self._turn_row(r) for r in turns], "steps": grouped}
+
+    # -- 附件 ---------------------------------------------------------------
+    def add_attachment(self, name, rel, path, kind, size, text):
+        with self.lock:
+            cur = self.con.execute(
+                """INSERT INTO attachments(name,rel,path,kind,size,text,ts)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (name, rel, path, kind, size, text, time.time()),
+            )
+            self.con.commit()
+            aid = cur.lastrowid
+        return self.get_attachment(aid)
+
+    def get_attachment(self, aid):
+        with self.lock:
+            row = self.con.execute(
+                """SELECT id,name,rel,path,kind,size,text,ts,message_id
+                     FROM attachments WHERE id=?""",
+                (aid,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "name": row[1], "rel": row[2], "path": row[3], "kind": row[4],
+            "size": row[5], "text": row[6], "ts": row[7], "message_id": row[8],
+        }
+
+    def bind_attachments(self, ids, message_id):
+        with self.lock:
+            for aid in ids:
+                self.con.execute(
+                    "UPDATE attachments SET message_id=? WHERE id=?", (message_id, aid)
+                )
+            self.con.commit()
+        return [self.get_attachment(a) for a in ids]
+
+    def attachments_for_message(self, message_id):
+        with self.lock:
+            rows = self.con.execute(
+                """SELECT id,name,rel,path,kind,size,text,ts,message_id
+                     FROM attachments WHERE message_id=? ORDER BY id""",
+                (message_id,),
+            ).fetchall()
+        return [
+            {"id": r[0], "name": r[1], "rel": r[2], "path": r[3], "kind": r[4],
+             "size": r[5], "text": r[6], "ts": r[7], "message_id": r[8]}
+            for r in rows
+        ]
+
+    def update_message(self, row_id, text):
+        with self.lock:
+            cur = self.con.execute("UPDATE messages SET text=? WHERE id=?", (text, row_id))
+            self.con.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get(row_id)
+
+    def delete_message(self, row_id):
+        with self.lock:
+            cur = self.con.execute("DELETE FROM messages WHERE id=?", (row_id,))
+            self.con.execute("DELETE FROM highlights WHERE message_id=?", (row_id,))
+            self.con.commit()
+            return cur.rowcount > 0
+
+    def set_highlight(self, row_id, on):
+        with self.lock:
+            cur = self.con.execute(
+                "UPDATE messages SET highlight=? WHERE id=?", (1 if on else 0, row_id)
+            )
+            self.con.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get(row_id)
+
+    # -- 片段高亮 -----------------------------------------------------------
+    def list_highlights(self, message_id):
+        with self.lock:
+            rows = self.con.execute(
+                "SELECT start,end,text FROM highlights WHERE message_id=? ORDER BY start",
+                (message_id,),
+            ).fetchall()
+        return [{"start": r[0], "end": r[1], "text": r[2]} for r in rows]
+
+    def add_highlight(self, message_id, start, end, text):
+        with self.lock:
+            # 与已有区间重叠的旧片段先去掉，再插入，保持互不重叠
+            rows = self.con.execute(
+                "SELECT id,start,end FROM highlights WHERE message_id=?", (message_id,)
+            ).fetchall()
+            for hid, s, e in rows:
+                if not (end <= s or start >= e):
+                    self.con.execute("DELETE FROM highlights WHERE id=?", (hid,))
+            self.con.execute(
+                "INSERT INTO highlights(message_id,start,end,text,ts) VALUES(?,?,?,?,?)",
+                (message_id, start, end, text, time.time()),
+            )
+            self.con.execute("UPDATE messages SET highlight=1 WHERE id=?", (message_id,))
+            self.con.commit()
+        return self.get(message_id)
+
+    def clear_highlights(self, message_id):
+        with self.lock:
+            self.con.execute("DELETE FROM highlights WHERE message_id=?", (message_id,))
+            self.con.execute("UPDATE messages SET highlight=0 WHERE id=?", (message_id,))
+            self.con.commit()
+        return self.get(message_id)
+
+    def highlights_map(self):
+        with self.lock:
+            rows = self.con.execute(
+                "SELECT message_id,start,end FROM highlights ORDER BY message_id,start"
+            ).fetchall()
+        out = {}
+        for mid, s, e in rows:
+            out.setdefault(mid, []).append({"start": s, "end": e})
+        return out
+
+    # -- sessions -----------------------------------------------------------
+    def get_session(self, agent):
+        with self.lock:
+            row = self.con.execute(
+                "SELECT session_id FROM sessions WHERE agent=?", (agent,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_session(self, agent, session_id):
+        with self.lock:
+            self.con.execute(
+                "INSERT INTO sessions(agent,session_id,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(agent) DO UPDATE SET session_id=excluded.session_id, updated_at=excluded.updated_at",
+                (agent, session_id, time.time()),
+            )
+            self.con.commit()
+
+    def clear_session(self, agent):
+        with self.lock:
+            self.con.execute("DELETE FROM sessions WHERE agent=?", (agent,))
+            self.con.commit()
+
+    # -- state --------------------------------------------------------------
+    def state_get(self, key, default=None):
+        with self.lock:
+            row = self.con.execute("SELECT v FROM state WHERE k=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def state_set(self, key, value):
+        with self.lock:
+            self.con.execute(
+                "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (key, value),
+            )
+            self.con.commit()
+
+    # -- models -------------------------------------------------------------
+    def list_models(self):
+        with self.lock:
+            rows = self.con.execute(
+                """SELECT id,label,style,base_url,api_key,model,system_prompt,path,
+                          max_tokens,enabled,created_at FROM models ORDER BY created_at"""
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "label": r[1],
+                "style": r[2],
+                "base_url": r[3],
+                "api_key": r[4],
+                "model": r[5],
+                "system_prompt": r[6],
+                "path": r[7],
+                "max_tokens": r[8],
+                "enabled": bool(r[9]),
+                "created_at": r[10],
+            }
+            for r in rows
+        ]
+
+    def get_model(self, model_id):
+        for m in self.list_models():
+            if m["id"] == model_id:
+                return m
+        return None
+
+    def upsert_model(self, item):
+        with self.lock:
+            self.con.execute(
+                """INSERT INTO models(id,label,style,base_url,api_key,model,system_prompt,path,
+                                      max_tokens,enabled,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     label=excluded.label, style=excluded.style, base_url=excluded.base_url,
+                     api_key=excluded.api_key, model=excluded.model,
+                     system_prompt=excluded.system_prompt, path=excluded.path,
+                     max_tokens=excluded.max_tokens, enabled=excluded.enabled""",
+                (
+                    item["id"], item["label"], item["style"], item["base_url"], item["api_key"],
+                    item["model"], item.get("system_prompt", ""), item.get("path") or "",
+                    int(item.get("max_tokens") or 1024),
+                    1 if item.get("enabled", True) else 0, item.get("created_at") or time.time(),
+                ),
+            )
+            self.con.commit()
+        return self.get_model(item["id"])
+
+    def delete_model(self, model_id):
+        with self.lock:
+            self.con.execute("DELETE FROM models WHERE id=?", (model_id,))
+            self.con.execute("DELETE FROM api_history WHERE model_id=?", (model_id,))
+            self.con.execute("DELETE FROM sessions WHERE agent=?", (model_id,))
+            self.con.commit()
+
+    def history(self, model_id, limit=24):
+        with self.lock:
+            rows = self.con.execute(
+                "SELECT role,content FROM api_history WHERE model_id=? ORDER BY id DESC LIMIT ?",
+                (model_id, limit),
+            ).fetchall()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+    def add_history(self, model_id, role, content):
+        with self.lock:
+            self.con.execute(
+                "INSERT INTO api_history(model_id,role,content,ts) VALUES(?,?,?,?)",
+                (model_id, role, content, time.time()),
+            )
+            self.con.commit()
+
+    def clear_history(self, model_id):
+        with self.lock:
+            self.con.execute("DELETE FROM api_history WHERE model_id=?", (model_id,))
+            self.con.commit()
+
+    # -- stats / health -----------------------------------------------------
+    def agent_stats(self):
+        with self.lock:
+            sent = dict(
+                self.con.execute(
+                    "SELECT sender, COUNT(*) FROM messages WHERE kind IN ('reply','error') GROUP BY sender"
+                ).fetchall()
+            )
+            received = dict(
+                self.con.execute("SELECT target, COUNT(*) FROM messages GROUP BY target").fetchall()
+            )
+            last = dict(
+                self.con.execute(
+                    "SELECT sender, MAX(ts) FROM messages WHERE kind IN ('reply','error') GROUP BY sender"
+                ).fetchall()
+            )
+        return {
+            name: {
+                "sent": sent.get(name, 0),
+                "received": received.get(name, 0),
+                "last_active": last.get(name),
+            }
+            for name in set(sent) | set(received) | set(last)
+        }
+
+    def health_counts(self):
+        with self.lock:
+            total = self.con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            errors = self.con.execute("SELECT COUNT(*) FROM messages WHERE kind='error'").fetchone()[0]
+        return {"messages": total, "errors": errors}
+
+    def nexus_map_upsert(self, agent_id, role):
+        with self.lock:
+            self.con.execute(
+                """INSERT INTO nexus_agents(id,role,first_seen,last_seen) VALUES(?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET role=excluded.role, last_seen=excluded.last_seen""",
+                (agent_id, role, time.time(), time.time()),
+            )
+            self.con.commit()
+
+    def nexus_role(self, agent_id):
+        with self.lock:
+            row = self.con.execute(
+                "SELECT role FROM nexus_agents WHERE id=?", (agent_id,)
+            ).fetchone()
+        return row[0] if row else None
+
+    # -- 工作区权限准入 -----------------------------------------------------
+    def list_grants(self, agent=None):
+        with self.lock:
+            if agent:
+                rows = self.con.execute(
+                    "SELECT agent,path,mode,ts FROM grants WHERE agent=? ORDER BY ts", (agent,)
+                ).fetchall()
+            else:
+                rows = self.con.execute(
+                    "SELECT agent,path,mode,ts FROM grants ORDER BY agent,ts"
+                ).fetchall()
+        return [{"agent": r[0], "path": r[1], "mode": r[2], "ts": r[3]} for r in rows]
+
+    def set_grant(self, agent, path, mode):
+        with self.lock:
+            self.con.execute(
+                """INSERT INTO grants(agent,path,mode,ts) VALUES(?,?,?,?)
+                   ON CONFLICT(agent,path) DO UPDATE SET mode=excluded.mode, ts=excluded.ts""",
+                (agent, path, "rw" if mode == "rw" else "ro", time.time()),
+            )
+            self.con.commit()
+        return self.list_grants(agent)
+
+    def remove_grant(self, agent, path):
+        with self.lock:
+            self.con.execute("DELETE FROM grants WHERE agent=? AND path=?", (agent, path))
+            self.con.commit()
+        return self.list_grants(agent)
+
+    def replace_grants(self, mapping):
+        """用 config.json 里的授权表重建内存库（config 是唯一真源）。"""
+        with self.lock:
+            self.con.execute("DELETE FROM grants")
+            for agent, items in (mapping or {}).items():
+                for item in items or []:
+                    path = (item.get("path") or "").strip()
+                    if not path:
+                        continue
+                    self.con.execute(
+                        "INSERT OR REPLACE INTO grants(agent,path,mode,ts) VALUES(?,?,?,?)",
+                        (agent, path, "rw" if (item.get("mode") or "rw") == "rw" else "ro", time.time()),
+                    )
+            self.con.commit()
+
+    def _perm_row(self, row):
+        return {
+            "id": row[0], "agent": row[1], "path": row[2], "mode": row[3],
+            "reason": row[4], "status": row[5], "ts": row[6], "resolved_ts": row[7],
+            "turn_id": row[8],
+        }
+
+    def add_perm_request(self, agent, path, mode, reason, turn_id=None):
+        with self.lock:
+            if turn_id is None:
+                turn_id = self.last_turn.get(agent)
+            cur = self.con.execute(
+                """INSERT INTO perm_requests(agent,path,mode,reason,status,ts,turn_id)
+                   VALUES(?,?,?,?, 'pending', ?, ?)""",
+                (agent, path, "rw" if mode == "rw" else "ro", reason, time.time(), turn_id),
+            )
+            self.con.commit()
+            rid = cur.lastrowid
+        return self.get_perm_request(rid)
+
+    def get_perm_request(self, rid):
+        with self.lock:
+            row = self.con.execute(
+                """SELECT id,agent,path,mode,reason,status,ts,resolved_ts,turn_id
+                     FROM perm_requests WHERE id=?""",
+                (rid,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._perm_row(row)
+
+    def list_perm_requests(self, status="pending"):
+        with self.lock:
+            if status:
+                rows = self.con.execute(
+                    """SELECT id,agent,path,mode,reason,status,ts,resolved_ts,turn_id
+                         FROM perm_requests WHERE status=? ORDER BY id""",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = self.con.execute(
+                    """SELECT id,agent,path,mode,reason,status,ts,resolved_ts,turn_id
+                         FROM perm_requests ORDER BY id"""
+                ).fetchall()
+        return [self._perm_row(r) for r in rows]
+
+    def resolve_perm_request(self, rid, approve):
+        with self.lock:
+            self.con.execute(
+                "UPDATE perm_requests SET status=?, resolved_ts=? WHERE id=?",
+                ("approved" if approve else "denied", time.time(), rid),
+            )
+            self.con.commit()
+        return self.get_perm_request(rid)
+
+
+# ---------------------------------------------------------------------- processes
+def stream_command(cmd, cwd, timeout, on_line, cancel=None, on_proc=None, input_text=None):
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=NO_WINDOW,
+        env=env,
+    )
+    if input_text is not None:
+        try:
+            proc.stdin.write(input_text)
+            proc.stdin.close()
+        except Exception:
+            pass
+    if on_proc:
+        try:
+            on_proc(proc)
+        except Exception:
+            pass
+    lines = []
+    q = queue.Queue()
+
+    def reader():
+        for line in proc.stdout:
+            q.put(line)
+        q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    deadline = None if not timeout or timeout <= 0 else time.time() + timeout
+    last_data = time.time()
+    started_at = time.time()
+    last_beat = started_at
+    while True:
+        if cancel is not None and cancel.is_set():
+            proc.kill()
+            lines.append("[cancelled]")
+            break
+        if deadline is None:
+            remaining = 0.5
+        else:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                proc.kill()
+                lines.append("[timeout]")
+                break
+        try:
+            item = q.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            if time.time() - last_beat > 60:
+                try:
+                    on_line(f"[仍在执行] 已运行 {int(time.time() - started_at)} 秒…")
+                except Exception:
+                    pass
+                last_beat = time.time()
+            if proc.poll() is not None:
+                # 进程已退出：队列空就收工；若管道被孙进程占着导致读不到 EOF，静默 15s 也判定结束
+                if q.empty():
+                    break
+                if time.time() - last_data > 15:
+                    lines.append("[子进程已退出，管道仍被其子进程占用，判定结束]")
+                    break
+            continue
+        if item is None:
+            break
+        line = item.rstrip("\r\n")
+        last_data = time.time()
+        lines.append(line)
+        try:
+            on_line(line)
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return proc.returncode, lines
+
+
+def _json_lines(lines):
+    for line in lines:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def resolve_command(exe):
+    """把裸命令名解析成真实可执行文件（Windows 上 npm 全局包常只有 .cmd）。"""
+    exe = os.path.expandvars(os.path.expanduser(exe))
+    if os.path.isabs(exe) and os.path.exists(exe):
+        return exe
+    names = [exe]
+    if os.name == "nt" and not exe.lower().endswith((".exe", ".cmd", ".bat")):
+        names = [exe + ".exe", exe + ".cmd", exe + ".bat", exe]
+    for folder in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not folder:
+            continue
+        for name in names:
+            candidate = os.path.join(folder, name)
+            if os.path.exists(candidate):
+                return candidate
+    return exe
+
+
+def wrap_command(cmd):
+    """cmd/bat 不能直接被 createProcess 执行：优先换成它包装的原生 exe，否则套 cmd /c。"""
+    if os.name != "nt" or not cmd:
+        return cmd
+    exe = cmd[0]
+    if exe.lower().endswith((".cmd", ".bat")):
+        shim_dir = os.path.dirname(exe)
+        for rel in (
+            os.path.join("node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+            os.path.join("node_modules", ".bin", os.path.splitext(os.path.basename(exe))[0] + ".exe"),
+        ):
+            candidate = os.path.join(shim_dir, rel)
+            if os.path.exists(candidate):
+                return [candidate] + cmd[1:]
+        return [os.environ.get("ComSpec", "cmd.exe"), "/d", "/s", "/c", exe] + cmd[1:]
+    return cmd
+
+
+# ------------------------------------------------------------------ 附件解析
+_PARSER_PY = None
+
+
+def parser_python():
+    """挑一个能 import pypdf 的解释器；找不到就用当前解释器（stdlib 兜底）。"""
+    global _PARSER_PY
+    if _PARSER_PY:
+        return _PARSER_PY
+    candidates = []
+    configured = (cfg_get("uploads", {}) or {}).get("parser_python")
+    if configured:
+        candidates.append(os.path.expandvars(configured))
+    bases = [
+        os.path.join(os.path.expanduser("~"), ".cache", "codex-runtimes"),   # 实际位置
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), ".cache", "codex-runtimes"),
+    ]
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            if "python.exe" in files and root.replace("/", "\\").endswith("\\dependencies\\python"):
+                candidates.append(os.path.join(root, "python.exe"))
+    candidates.append(sys.executable)
+    for exe in candidates:
+        if not exe or not os.path.exists(exe):
+            continue
+        try:
+            probe = subprocess.run([exe, "-c", "import pypdf"],
+                                   capture_output=True, timeout=40, creationflags=NO_WINDOW)
+            if probe.returncode == 0:
+                _PARSER_PY = exe
+                return exe
+        except Exception:
+            continue
+    _PARSER_PY = sys.executable
+    return _PARSER_PY
+
+
+def extract_file(path, max_chars):
+    exe = parser_python()
+    script = os.path.join(HUB_DIR, "extract.py")
+    try:
+        proc = subprocess.run(
+            [exe, script, path, "--max-chars", str(max_chars)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300, creationflags=NO_WINDOW,
+        )
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.loads(line)
+    except Exception as exc:  # noqa: BLE001
+        return {"kind": "error", "text": f"（解析失败：{exc}）", "meta": {}}
+    return {"kind": "error", "text": "（解析器没有返回结果）", "meta": {}}
+
+
+def human_size(size):
+    value = float(size or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+# ------------------------------------------------------------ 子进程台账（防孤儿）
+CHILD_PID_FILE = os.path.join(HUB_DIR, "hub.pids.json")
+_CHILD_HINTS = ("claude", "codex", "node", "workbuddy", "codebuddy")
+
+
+def load_child_pids():
+    try:
+        with open(CHILD_PID_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [int(x) for x in data if str(x).isdigit()]
+    except Exception:
+        return []
+
+
+def save_child_pids(pids):
+    try:
+        with open(CHILD_PID_FILE, "w", encoding="utf-8") as fh:
+            json.dump(sorted(set(int(p) for p in pids)), fh)
+    except Exception:
+        pass
+
+
+def process_image_path(pid):
+    """用 ctypes 取进程可执行文件路径（不引入 psutil）。"""
+    if os.name != "nt":
+        return ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def kill_pid(pid):
+    try:
+        subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                       capture_output=True, creationflags=NO_WINDOW, timeout=20)
+        return True
+    except Exception:
+        return False
+
+
+def sweep_stale_children():
+    """启动时清掉上一次（可能是硬杀）留下的成员子进程，避免堆积。"""
+    pids = load_child_pids()
+    killed = []
+    for pid in pids:
+        path = process_image_path(pid)
+        if not path:
+            continue
+        low = path.lower()
+        if any(hint in low for hint in _CHILD_HINTS):
+            if kill_pid(pid):
+                killed.append(pid)
+    save_child_pids([])
+    return killed
+
+
+# -------------------------------------------------------------------- http calls
+def http_json(url, payload, headers, timeout=180):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"HTTP {err.code}: {detail}") from None
+    except urllib.error.URLError as err:
+        raise RuntimeError(f"网络错误: {err.reason}") from None
+
+
+def call_model_stream(style, base_url, api_key, model, messages, system="", max_tokens=1024,
+                      timeout=180, path=None, on_text=None, temperature=None, usage_out=None,
+                      cancel=None):
+    """流式调用；每收到一段文本就 on_text(片段)，返回完整文本。
+
+    `usage_out`：传入 dict 就地把 provider 报的 tokens 填进去（in_tokens/out_tokens）。
+    返回签名不变 —— 这个函数有多个调用点，改返回值会静默解包错位。
+    """
+    url = endpoint(base_url, style, path)
+    parts = []
+    thinking = []
+    stop_reason = None
+
+    def emit(chunk):
+        if not chunk:
+            return
+        parts.append(chunk)
+        if on_text:
+            on_text(chunk)
+
+    if style == "anthropic":
+        body = {"model": model, "max_tokens": int(max_tokens or 1024), "messages": messages, "stream": True}
+        if system:
+            body["system"] = system
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Accept": "text/event-stream"}
+    else:
+        body = {"model": model, "messages": ([{"role": "system", "content": system}] if system else []) + messages,
+                "max_tokens": int(max_tokens or 1024), "stream": True}
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "text/event-stream"}
+
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw in resp:
+                if cancel is not None and cancel.is_set():   # 停止键：立刻收口
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    raise Cancelled()
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if style == "anthropic":
+                    if obj.get("type") == "content_block_delta":
+                        delta = obj.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            emit(delta.get("text") or "")
+                        elif delta.get("type") == "thinking_delta":
+                            thinking.append(delta.get("thinking") or "")
+                    elif obj.get("type") == "message_start":
+                        # §5.2：input 在 message_start、output 在 message_delta，分两处来，
+                        # 取其一都是错的 —— 这里两个都要接住。
+                        u = (obj.get("message") or {}).get("usage") or {}
+                        if usage_out is not None and u.get("input_tokens") is not None:
+                            usage_out["in_tokens"] = u["input_tokens"]
+                    elif obj.get("type") == "message_delta":
+                        u = obj.get("usage") or {}
+                        if usage_out is not None and u.get("output_tokens") is not None:
+                            usage_out["out_tokens"] = u["output_tokens"]
+                        stop_reason = (obj.get("delta") or {}).get("stop_reason") or stop_reason
+                else:
+                    if usage_out is not None and obj.get("usage"):
+                        u = obj["usage"]
+                        if u.get("prompt_tokens") is not None:
+                            usage_out["in_tokens"] = u["prompt_tokens"]
+                        if u.get("completion_tokens") is not None:
+                            usage_out["out_tokens"] = u["completion_tokens"]
+                    for choice in obj.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        emit(delta.get("content") or "")
+                        if delta.get("reasoning_content"):
+                            thinking.append(delta["reasoning_content"])
+                        if choice.get("finish_reason"):
+                            stop_reason = choice["finish_reason"]
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"HTTP {err.code}: {detail}") from None
+    except urllib.error.URLError as err:
+        raise RuntimeError(f"网络错误: {err.reason}") from None
+    text = "".join(parts).strip()
+    if not text:
+        reason = "".join(thinking).strip()
+        if reason:
+            text = (
+                "（模型本轮只输出了思考内容，没有正文——通常是「单次最大输出」被思考占满；"
+                "把该成员的 max_tokens / 单次最大输出调大即可）\n\n" + reason
+            )
+        else:
+            raise RuntimeError(f"返回为空（stop_reason={stop_reason}）")
+    return text
+
+
+VERSION_SEG = re.compile(r"/v\d+[a-z0-9]*$", re.IGNORECASE)
+
+
+def endpoint(base_url, style, path=None):
+    """拼接真实接口地址。path 可显式给出（如 /chat/completions 或完整 URL）。"""
+    base = (base_url or "").strip().rstrip("/")
+    path = (path or "").strip()
+    if path:
+        if path.lower().startswith("http"):
+            return path
+        return base + (path if path.startswith("/") else "/" + path)
+    if style == "anthropic":
+        if base.endswith("/messages"):
+            return base
+        if base.endswith("/v1"):
+            return base + "/messages"
+        return base + "/v1/messages"
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1") or VERSION_SEG.search(base):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
+def call_model(style, base_url, api_key, model, messages, system="", max_tokens=1024,
+               timeout=180, path=None, temperature=None, usage_out=None):
+    """messages: [{'role': 'user'|'assistant', 'content': str}] -> text
+
+    `usage_out`：传入 dict 就地把 provider 报的 tokens 填进去（in_tokens/out_tokens）。
+    """
+    url = endpoint(base_url, style, path)
+    if style == "anthropic":
+        body = {
+            "model": model,
+            "max_tokens": int(max_tokens or 1024),
+            "messages": messages,
+        }
+        if system:
+            body["system"] = system
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        data = http_json(url, body, headers, timeout)
+        if usage_out is not None:
+            u = data.get("usage") or {}
+            if u.get("input_tokens") is not None:
+                usage_out["in_tokens"] = u["input_tokens"]
+            if u.get("output_tokens") is not None:
+                usage_out["out_tokens"] = u["output_tokens"]
+        parts = data.get("content") or []
+        text = "\n".join(
+            p.get("text", "") for p in parts
+            if isinstance(p, dict) and p.get("type") != "thinking"
+        ).strip()
+        if not text:
+            thinking = "\n".join(
+                p.get("thinking", "") for p in parts
+                if isinstance(p, dict) and p.get("type") == "thinking"
+            ).strip()
+            if thinking:
+                text = ("（模型本轮只输出了思考内容，没有正文——通常是 max_tokens 被思考占满）\n\n" + thinking)
+        if not text:
+            raise RuntimeError(f"返回为空：{json.dumps(data, ensure_ascii=False)[:300]}")
+        return text
+    body = {"model": model, "messages": ([{"role": "system", "content": system}] if system else []) + messages}
+    body["max_tokens"] = int(max_tokens or 1024)
+    if temperature is not None:
+        body["temperature"] = float(temperature)
+    data = http_json(url, body, {"Authorization": f"Bearer {api_key}"}, timeout)
+    if usage_out is not None:
+        u = data.get("usage") or {}
+        if u.get("prompt_tokens") is not None:
+            usage_out["in_tokens"] = u["prompt_tokens"]
+        if u.get("completion_tokens") is not None:
+            usage_out["out_tokens"] = u["completion_tokens"]
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"返回为空：{json.dumps(data, ensure_ascii=False)[:300]}")
+    message = choices[0].get("message") or {}
+    text = (message.get("content") or "").strip()
+    if not text and message.get("reasoning_content"):
+        text = ("（模型本轮只输出了思考内容，没有正文——通常是 max_tokens 被思考占满）\n\n"
+                + str(message["reasoning_content"]).strip())
+    if not text:
+        raise RuntimeError(f"返回为空：{json.dumps(data, ensure_ascii=False)[:300]}")
+    return text
+
+
+# ------------------------------------------------------------------------- agents
+ROLE_SYSTEM = (
+    "你在一个本地群聊里充当成员 {label}，同群的还有 user（人）以及其他 AI 成员。"
+    "你会直接收到投递给你的消息。回答保持简洁、直接、可执行；需要别人参与就在回复中 @ 对方。"
+)
+
+
+class Cancelled(Exception):
+    """本轮被用户手动中断。"""
+
+
+class TraceSink:
+    """一个 turn 的写入句柄（§1 持久事实层）。trace.enabled=false 时整体 no-op。
+
+    事件协议（runner → sink）：llm_start / llm_usage / llm_end / tool_start /
+    tool_end / tool_result / thinking / text / note。逐字增量**不**走这里（§11）。
+    """
+
+    def __init__(self, hub, agent, depth=0, trace_id=None, parent_turn_id=None,
+                 trigger_kind="user", trigger_msg_id=None, trigger_by=None,
+                 model=None, session_id=None, agent_id=None):
+        self.hub = hub
+        self.enabled = trace_enabled()
+        self.id = uuid.uuid4().hex
+        self.trace_id = trace_id or uuid.uuid4().hex
+        self.open_steps = {}        # key -> step_id（开放式 step 的配对钥匙）
+        self.error = None           # 最近一次 trace 写入失败（不许静默，见 on_event）
+        self.agent = agent          # 显示名（人看的）
+        self.agent_id = agent_id or agent   # 路由 id（权限挂靠等内部用途）
+        self._model_set = False     # turn.model 是否已从 stream 回填过
+        if not self.enabled:
+            return
+        row = hub.store.open_turn(
+            self.id, self.trace_id, agent, depth=depth, parent_turn_id=parent_turn_id,
+            trigger_kind=trigger_kind, trigger_msg_id=trigger_msg_id, trigger_by=trigger_by,
+            model=model, session_id=session_id, agent_id=self.agent_id,
+        )
+        hub.broadcast({"type": "turn_started", "turn": row})
+
+    # -- 落库 -------------------------------------------------------------
+    def step(self, kind, name=None, status="ok", detail=None, in_tokens=None, out_tokens=None):
+        if not self.enabled:
+            return None
+        row = self.hub.store.add_step(self.id, kind, name, status, detail, in_tokens, out_tokens)
+        self.hub.broadcast({"type": "step", "turn_id": self.id, "step": row})
+        return row["id"]
+
+    def open(self, kind, name=None, detail=None, key=None):
+        if not self.enabled:
+            return None
+        row = self.hub.store.add_step(self.id, kind, name, "running", detail)
+        self.hub.broadcast({"type": "step", "turn_id": self.id, "step": row})
+        if key:
+            self.open_steps[key] = row["id"]
+        return row["id"]
+
+    def end(self, key, status="ok", detail=None, in_tokens=None, out_tokens=None):
+        if not self.enabled:
+            return
+        step_id = self.open_steps.pop(key, None)
+        if step_id is None and self.open_steps:
+            step_id = self.open_steps.pop(next(reversed(self.open_steps)))
+        if step_id is None:
+            return
+        row = self.hub.store.end_step(step_id, status, detail, in_tokens, out_tokens)
+        if row:
+            self.hub.broadcast({"type": "step", "turn_id": self.id, "step": row})
+
+    def usage(self, key="llm", in_tokens=None, out_tokens=None):
+        """一次 API 调用的 usage 回写到还没关的 step 上（不关 step）。
+
+        Claude 的 usage 分两处来（message_start 给 input、message_delta 给 output），
+        所以是一路补写、最后一次 llm_end 才收口 —— 一个 turn 内 N 次调用各占一行（§5.2）。
+        """
+        if not self.enabled or (in_tokens is None and out_tokens is None):
+            return
+        step_id = self.open_steps.get(key)
+        if step_id is None:
+            return
+        row = self.hub.store.set_step_usage(step_id, in_tokens, out_tokens)
+        if row:
+            self.hub.broadcast({"type": "step", "turn_id": self.id, "step": row})
+
+    def close(self, status, *, end_ts, reply_msg_id=None, error_text=None,
+              in_chars=None, out_chars=None):
+        """收尾。幂等由 `Store.settle_turn` 保证：status 只从 running 迁出一次，
+        `end_ts` 首次写入者胜，`reply_msg_id` 只在为空时补写（§7.3）。"""
+        if not self.enabled:
+            return None
+        self.open_steps.clear()
+        row = self.hub.store.settle_turn(
+            self.id, status, end_ts=end_ts, reply_msg_id=reply_msg_id,
+            error_text=error_text, in_chars=in_chars, out_chars=out_chars,
+        )
+        self.hub.broadcast({"type": "turn_ended", "turn": row})
+        return row
+
+    # -- runner 事件 -------------------------------------------------------
+    def on_event(self, kind, payload):
+        if not self.enabled:
+            return
+        payload = payload or {}
+        try:
+            if kind == "llm_start":
+                if payload.get("model") and not self._model_set:
+                    self._model_set = True     # 只补一次，别每次调用都写库
+                    self.hub.store.set_turn_model(self.id, payload.get("model"))
+                self.end("llm", "ok")          # 上一次调用没收到 end，先收敛
+                self.open("llm_call", payload.get("model"),
+                          {"phase": "start"}, key="llm")
+            elif kind == "llm_usage":
+                self.usage("llm", payload.get("in_tokens"), payload.get("out_tokens"))
+            elif kind == "llm_end":
+                in_tokens = payload.get("in_tokens")
+                out_tokens = payload.get("out_tokens")
+                detail = {"phase": "end"}
+                if payload.get("usage_keys"):
+                    detail["usage_keys"] = payload["usage_keys"]   # 挖不到 provider 真值时的线索
+                if "llm" not in self.open_steps:
+                    self.step("llm_call", payload.get("model"), "ok",
+                              detail, in_tokens, out_tokens)
+                else:
+                    self.end("llm", "ok", detail, in_tokens, out_tokens)
+            elif kind == "tool_start":
+                key = f"tool:{payload.get('id') or payload.get('name') or len(self.open_steps)}"
+                self.open("tool_call", payload.get("name"),
+                          tool_detail(payload.get("name"), payload.get("input")), key=key)
+            elif kind == "tool_end":
+                # 入参在 content_block_stop / item/completed 才齐（claude 系是流式拼出来的），
+                # 所以真正的 detail 在这里落；tool_detail 无内容时返回 None，
+                # COALESCE 保证不会把 tool_start 已经写好的 detail 覆盖成空。
+                self.end(f"tool:{payload.get('id')}" if payload.get("id") else None,
+                         "error" if payload.get("error") else "ok",
+                         tool_detail(payload.get("name"), payload.get("input"),
+                                     payload.get("output")))
+            elif kind == "tool_result":
+                self.step("tool_result", payload.get("name"),
+                          "error" if payload.get("error") else "ok",
+                          {"content": payload.get("content")})
+            elif kind == "thinking":
+                self.step("thinking", None, "ok", {"text": payload.get("text")})
+            elif kind == "text":
+                self.step("text", None, "ok", {"text": payload.get("text")})
+            elif kind == "note":
+                self.step("note", payload.get("name"), "ok", {"text": payload.get("text")})
+        except Exception as exc:   # trace 写失败不影响主流程，但**不许静默**（否则协议缺方法也看不见）
+            self.error = f"{kind}: {type(exc).__name__}: {exc}"
+            try:
+                self.hub.trace_error = self.error
+            except Exception:
+                pass
+
+
+def role_preamble(agent_label, sender, target, others, shared_context=""):
+    names = "、".join(others) if others else "（暂无其他人）"
+    head = ""
+    if shared_context.strip():
+        head = f"[群公告 / 共享上下文]\n{shared_context.strip()}\n\n"
+    return head + (
+        f"[本地群聊] 成员：user（人）、{names}。当前发言来自 {sender}，"
+        f"该消息投递给你（{agent_label}），面向对象：{target}。"
+        "需要其他成员参与时，在回复里用 @名字 点名；不需要就正常回答。\n\n"
+    )
+
+
+def run_claude(agent, prompt, session_id, on_text, cancel=None, on_proc=None, on_event=None):
+    def _ev(kind, payload=None):
+        """trace 事件出口。逐字增量绝不走这里（§11），只发结构化事件。"""
+        if on_event is None:
+            return
+        try:
+            on_event(kind, payload)
+        except Exception:
+            pass
+
+    cfg = CONFIG["agents"][agent]
+    settings_dir = os.path.expandvars(cfg.get("settings_dir", ""))
+    profile = cfg.get("settings_profile")
+    cmd = [resolve_command(cfg.get("exe", "claude"))]
+    if profile:
+        cmd += ["--settings", os.path.join(settings_dir, profile + ".json")]
+    # prompt 一律走 stdin：Windows 命令行上限约 32KB，「无限上下文」很容易超过（WinError 206）
+    cmd += ["-p", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages", "--dangerously-skip-permissions"]
+    if not HUB.streaming_on(agent):
+        cmd = [x for x in cmd if x not in ("stream-json", "--verbose", "--include-partial-messages")]
+        cmd.insert(cmd.index("--output-format") + 1, "json")
+    cmd += ["--append-system-prompt", ROLE_SYSTEM.format(label=LABELS.get(agent, agent))]
+    for extra_dir in HUB.grants_rw(agent):
+        cmd += ["--add-dir", extra_dir]
+    cmd = wrap_command(cmd)
+    forms = []
+    if session_id:
+        forms.append(cmd + ["--resume", session_id])
+    forms.append(cmd)
+    argv_fallback = len(prompt) < 20000      # 提示词不长时保留旧的 argv 形式做兜底
+    last_err = ""
+    for form in forms:
+        state = {"text": "", "session": session_id, "result": "", "thinking": ""}
+        state["phase"] = None
+
+        def on_line(line, _state=state):
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                return
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                return
+            if obj.get("session_id"):
+                _state["session"] = obj["session_id"]
+            if obj.get("type") == "stream_event":
+                event = obj.get("event") or {}
+                etype = event.get("type")
+                if etype == "message_start":
+                    message = event.get("message") or {}
+                    _state["tools"] = {}
+                    _ev("llm_start", {"model": message.get("model")})
+                    usage = message.get("usage") or {}
+                    # 真 Anthropic：input 在 message_start 给。
+                    # workbuddy 系（hy4-preview）的 message_start 是**全零占位**
+                    # （实测 .verify/raw-codebuddy.jsonl：input_tokens=0），真值在
+                    # message_delta —— 所以这里只认真值（>0），别把占位 0 写进列里，
+                    # 那正是 CodeBuddy 链 `in_tokens` 恒 0 的成因。
+                    if usage.get("input_tokens"):
+                        _ev("llm_usage", {"in_tokens": usage.get("input_tokens")})
+                elif etype == "message_delta":
+                    usage = event.get("usage") or {}
+                    # 两处都取：缺失的一侧传 None，sink 侧 COALESCE 保留已有值。
+                    # 只取 output_tokens 会让 workbuddy 系的 input 永远丢（§5.2）。
+                    if usage.get("input_tokens") or usage.get("output_tokens") is not None:
+                        _ev("llm_usage", {"in_tokens": usage.get("input_tokens"),
+                                          "out_tokens": usage.get("output_tokens")})
+                elif etype == "message_stop":
+                    _ev("llm_end", {})
+                elif etype == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        on_text(f"\n[工具] {block.get('name') or 'tool'}\n")
+                        _state.setdefault("tools", {})[event.get("index")] = {
+                            "id": block.get("id"), "name": block.get("name")}
+                        _ev("tool_start", {"id": block.get("id"), "name": block.get("name")})
+                elif etype == "content_block_stop":
+                    info = _state.setdefault("tools", {}).pop(event.get("index"), None)
+                    if info:
+                        _ev("tool_end", {
+                            "id": info.get("id"), "name": info.get("name"),
+                            "input": _parse_tool_json(
+                                _state.setdefault("tool_json", {}).pop(event.get("index"), "")),
+                        })
+                elif etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "input_json_delta":
+                        # tool_use 的入参是**流式**到达的：content_block_start 时
+                        # content_block.input 还是空 {}，真值在 partial_json 里逐片拼。
+                        # 不接这一支，Edit 的 old_string/new_string 永远进不了库 ——
+                        # 截图里的红绿 diff 就没有数据源（这正是本轮的缺口）。
+                        _buf = _state.setdefault("tool_json", {})
+                        _idx = event.get("index")
+                        _buf[_idx] = _buf.get(_idx, "") + (delta.get("partial_json") or "")
+                    elif delta.get("type") == "text_delta" and delta.get("text"):
+                        if _state["phase"] != "text":
+                            _state["phase"] = "text"
+                            on_text("\n【正文】\n" if _state["thinking"] else "")
+                        _state["text"] += delta["text"]
+                        on_text(delta["text"])
+                    elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                        if _state["phase"] != "think":
+                            _state["phase"] = "think"
+                            on_text("【思考中】")
+                        _state["thinking"] += delta["thinking"]
+                        on_text(delta["thinking"])
+            elif obj.get("type") == "result" and obj.get("result"):
+                _state["result"] = obj["result"]
+
+        rc, lines = stream_command(
+            form, DEFAULT_CWD, turn_timeout(agent), on_line, cancel, on_proc,
+            input_text=prompt,
+        )
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        text = (state["result"] or state["text"]).strip()
+        if not text and state["thinking"].strip():
+            text = ("（模型本轮只输出了思考内容，没有正文；把该成员的 max_tokens / 单次最大输出调大通常可解决）\n\n"
+                    + state["thinking"].strip())
+        if text:
+            return {"session_id": state["session"], "text": text}
+        last_err = " / ".join(lines[-3:])
+        if argv_fallback:
+            rc, lines = stream_command(
+                form + [prompt], DEFAULT_CWD, turn_timeout(agent), on_line, cancel, on_proc
+            )
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            text = (state["result"] or state["text"]).strip()
+            if text:
+                return {"session_id": state["session"], "text": text}
+    raise RuntimeError(f"claude 调用失败：{last_err[:300]}")
+
+
+def pick_usage(obj, _depth=0):
+    """从 codex app-server 的事件里挖本 turn 的 token 用量（§5.2/§5.3）。
+
+    各版本字段名不一；`tokenUsage` 里 `total` 是整条 thread 的累计值，
+    只有 `last` 是本 turn 的 —— 拿 total 当 turn 值会把历史轮次重复计费，
+    所以先在 `last` 上取值。挖不到返回 {}，调用方据此留线索，不静默当 0。
+    """
+    if not isinstance(obj, dict) or _depth > 4:
+        return {}
+    node = obj["last"] if isinstance(obj.get("last"), dict) else obj
+    for key_in, key_out in (("inputTokens", "outputTokens"),
+                            ("input_tokens", "output_tokens")):
+        i, o = node.get(key_in), node.get(key_out)
+        if i is None and o is None:
+            continue
+        out = {}
+        if isinstance(i, (int, float)):
+            out["in_tokens"] = int(i)
+        if isinstance(o, (int, float)):
+            out["out_tokens"] = int(o)
+        return out
+    for key in ("turn", "usage", "tokenUsage"):
+        got = pick_usage(obj.get(key), _depth + 1)
+        if got:
+            return got
+    return {}
+
+
+def usage_keys_hint(obj):
+    """挖不到 usage 时留线索：真跑一轮后 /api/trace 里直接能看到该版本的字段名。"""
+    if not isinstance(obj, dict):
+        return ""
+    keys = sorted(obj.keys())
+    turn = obj.get("turn")
+    if isinstance(turn, dict):
+        keys += ["turn." + k for k in sorted(turn.keys())]
+    return ",".join(keys)[:200]
+
+
+def run_codex(agent, prompt, session_id, on_text, cancel=None, on_proc=None, on_event=None):
+    """app-server 偶发"启动即退出"（首次握手失败）→ 自动重试一次，别把错误直接抛给用户。"""
+    attempts = 2
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_codex_once(agent, prompt, session_id, on_text, cancel, on_proc, on_event)
+        except Cancelled:
+            raise
+        except RuntimeError as exc:
+            last_exc = exc
+            msg = str(exc)
+            transient = ("app-server 已退出" in msg) or ("无响应" in msg)
+            if not transient or attempt >= attempts:
+                raise
+            if on_event is not None:
+                try:
+                    on_event("note", {"name": "codex retry", "text": f"app-server 首次握手失败，重试 {attempt + 1}/{attempts}"})
+                except Exception:
+                    pass
+            time.sleep(2)
+    raise last_exc if last_exc else RuntimeError("codex 调用失败")
+
+
+def _run_codex_once(agent, prompt, session_id, on_text, cancel=None, on_proc=None, on_event=None):
+    def _ev(kind, payload=None):
+        # trace 事件出口（codex app-server 的 item/* 事件）
+        if on_event is None:
+            return
+        try:
+            on_event(kind, payload)
+        except Exception:
+            pass
+
+    cfg = CONFIG["agents"][agent]
+    exe = resolve_command(cfg.get("exe", "codex"))
+    if not HUB.streaming_on(agent):
+        on_text = lambda _chunk: None      # 关掉流式：只留最终结果
+    # app-server 的 stdio 通道才有 token 级增量（exec --json 只有整条消息）
+    sandbox, cwd = HUB.codex_turn_policy(agent)
+    proc = subprocess.Popen(
+        [exe, "app-server"],
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=NO_WINDOW,
+    )
+    if on_proc:
+        try:
+            on_proc(proc)
+        except Exception:
+            pass
+    inbox = queue.Queue()
+
+    def reader():
+        for line in proc.stdout:
+            inbox.put(line)
+        inbox.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    def send(obj):
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+
+    def next_obj(timeout):
+        try:
+            line = inbox.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if line is None:
+            raise RuntimeError("app-server 已退出")
+        line = line.strip()
+        if not line.startswith("{"):
+            return {}
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return {}
+
+    def wait_response(rid, timeout=90):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            obj = next_obj(0.5)
+            if obj is None or not obj:
+                continue
+            if obj.get("id") == rid:
+                if obj.get("error"):
+                    raise RuntimeError(str(obj["error"])[:200])
+                return obj.get("result") or {}
+        raise RuntimeError("codex app-server 无响应")
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "claudelink-hub", "version": "1.0"}}})
+        wait_response(1, 90)
+
+        tid = None
+        thread_model = None
+        if session_id:
+            try:
+                send({"jsonrpc": "2.0", "id": 2, "method": "thread/resume", "params": {"threadId": session_id}})
+                res = wait_response(2, 60)
+                tid = (res.get("thread") or {}).get("id") or res.get("threadId") or session_id
+                thread_model = (res.get("thread") or {}).get("model") or res.get("model")
+            except Exception:
+                tid = None
+        if not tid:
+            send({"jsonrpc": "2.0", "id": 2, "method": "thread/start",
+                  "params": {"cwd": cwd, "approvalPolicy": "never", "sandboxPolicy": sandbox}})
+            res = wait_response(2, 90)
+            tid = (res.get("thread") or {}).get("id") or res.get("threadId")
+            thread_model = (res.get("thread") or {}).get("model") or res.get("model")
+        if not tid:
+            raise RuntimeError("无法创建 codex thread")
+
+        send({"jsonrpc": "2.0", "id": 3, "method": "turn/start",
+              "params": {"threadId": tid,
+                         "input": ([{"type": "text", "text": prompt}]
+                                   + [{"type": "localImage", "path": p}
+                                      for p in (HUB.current_images.get(agent) or [])]),
+                         "cwd": cwd, "approvalPolicy": "never", "sandboxPolicy": sandbox}})
+
+        deltas, final_text, turn_id = [], "", None
+        pending_usage = {}      # 见下面 thread/tokenUsage/updated 分支
+        phase = None
+        limit = turn_timeout(agent)
+        deadline = None if limit == 0 else time.time() + limit
+        started_at = time.time()
+        last_event = started_at
+        idle_exit = 15          # app-server 退出后允许的静默秒数
+        while True:
+            if cancel is not None and cancel.is_set():
+                try:
+                    send({"jsonrpc": "2.0", "id": 9, "method": "turn/interrupt",
+                          "params": {"threadId": tid, "turnId": turn_id}})
+                except Exception:
+                    pass
+                raise Cancelled()
+            if deadline is not None and time.time() > deadline:
+                raise RuntimeError("超时")
+            obj = next_obj(0.5)
+            if obj is None or not obj:
+                if proc.poll() is not None and time.time() - last_event > idle_exit:
+                    if final_text or deltas:
+                        # 静默退出也要收口，否则 llm 步骤永远 running。
+                        # 带上已收到的 usage —— app-server 常在 turn/completed 之前
+                        # 就退出，丢掉它就等于这一轮的 token 永远是 0。
+                        _ev("llm_end", dict(pending_usage))
+                        break
+                    raise RuntimeError("codex app-server 已退出，但没有返回任何结果")
+                if time.time() - last_event > 60:
+                    on_text(f"\n[仍在执行] 已运行 {int(time.time() - started_at)} 秒…\n")
+                    last_event = time.time()
+                continue
+            last_event = time.time()
+            method = obj.get("method")
+            params = obj.get("params") or {}
+            if method and obj.get("id") is not None:      # 服务端反向请求：一律拒绝
+                send({"jsonrpc": "2.0", "id": obj["id"], "result": {}})
+                continue
+            if method == "turn/started":
+                turn_id = params.get("turnId") or (params.get("turn") or {}).get("id") or turn_id
+                # 开 llm 步骤：只靠 turn/completed 的 llm_end 建行，界面上一整轮
+                # 「正在思考」都不会出现，且 turn.model 永远补不上（§3.1）
+                turn_obj = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                # model 名不在 turn/started 里：实测它在 thread/start 的响应
+                # `thread.model`（.verify/raw-codex.jsonl）。thread/started 那条通知
+                # 会被 wait_response 当无关对象吃掉，所以只能从响应里带下来 ——
+                # 否则 turn.model 永远 NULL，按模型聚合成本这条就直接废掉。
+                _ev("llm_start", {"model": params.get("model") or turn_obj.get("model")
+                                           or thread_model})
+            elif method == "thread/tokenUsage/updated":
+                # ★ 实测（.verify/raw-codex.jsonl）：codex 的 token 用量**不在**
+                # turn/completed 里 —— 后者的 params 只有 threadId/turn，
+                # 真值是一条独立的 thread/tokenUsage/updated：
+                #   params.tokenUsage.last.{inputTokens,outputTokens,cachedInputTokens,...}
+                # 只读 turn/completed ⇒ pick_usage 恒空 ⇒ codex 永远 estimated/0。
+                # 取 `last`（本 turn）不取 `total`（整条 thread 累计，会把历史轮次重复计费）。
+                if not params.get("turnId") or turn_id in (None, params.get("turnId")):
+                    got = pick_usage(params)
+                    if got:
+                        pending_usage = got
+            elif method == "item/started":
+                item = params.get("item") or {}
+                kind_ = item.get("type")
+                if kind_ and kind_ not in ("userMessage", "agentMessage", "reasoning"):
+                    detail = (item.get("command") or item.get("path") or item.get("name")
+                              or item.get("tool") or "")
+                    on_text(f"\n[工具] {kind_} {str(detail)[:90]}\n")
+                    # name 只放工具名，参数进 input（§3.1）—— 塞成
+                    # 「commandExecution "C:\..."」会让界面上顶出一整行路径。
+                    # input 带上原始字段而不是 str(detail)[:400]：那个截断会把命令
+                    # 从中间切断，截图里的 Shell 命令块就永远展示不全；按字段截断
+                    # 由 tool_detail 统一做。
+                    raw_in = {k: item[k] for k in
+                              ("command", "path", "name", "query", "pattern", "cwd",
+                               "changes") if item.get(k)}
+                    if not raw_in and detail:
+                        raw_in = {"name": str(detail)[:400]}
+                    _ev("tool_start", {"id": item.get("id"), "name": kind_, "input": raw_in})
+            elif method == "item/agentMessage/delta":
+                delta = params.get("delta") or ""
+                if delta:
+                    if phase != "text":
+                        phase = "text"
+                        if deltas:
+                            on_text("\n【正文】\n")
+                    deltas.append(delta)
+                    on_text(delta)
+            elif method == "item/reasoning/textDelta":
+                delta = params.get("delta") or ""
+                if delta and phase is None:
+                    phase = "think"
+                    on_text("【思考中】")
+                if delta and phase == "think":
+                    on_text(delta)
+            elif method == "item/completed":
+                item = params.get("item") or {}
+                if item.get("type") not in ("userMessage", "agentMessage", "reasoning"):
+                    # 命令的输出体与退出码也在这里回来 —— 截图里 Shell 块下面的
+                    # 那几行就是它。exitCode 非 0 才是失败，别把 0 当 error。
+                    out = item.get("aggregatedOutput")
+                    if not isinstance(out, str):
+                        out = item.get("output")
+                    _ev("tool_end", {"id": item.get("id"), "name": item.get("type"),
+                                     "output": out if isinstance(out, str) else None,
+                                     "error": bool(item.get("exitCode"))})
+                if item.get("type") == "agentMessage" and item.get("text"):
+                    final_text = item["text"]
+            elif method == "turn/completed":
+                # §5.2：codex 的真值在 turn.usage（本 turn 的），不是 thread 累计。
+                # 挖不到时带上字段名线索 —— 别静默当 0，那正是「永远 estimated」的成因。
+                usage = pick_usage(params) or pending_usage
+                if usage:
+                    _ev("llm_end", usage)
+                else:
+                    _ev("llm_end", {"usage_keys": usage_keys_hint(params)})
+                break
+            elif method in ("turn/failed", "error"):
+                raise RuntimeError(json.dumps(obj, ensure_ascii=False)[:300])
+
+        text = (final_text or "".join(deltas)).strip()
+        if not text:
+            raise RuntimeError("codex 没有返回文本")
+        return {"session_id": tid, "text": text}
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_codebuddy(agent, prompt, session_id, on_text, cancel=None, on_proc=None, on_event=None):
+    def _ev(kind, payload=None):
+        """trace 事件出口（同 run_claude）。"""
+        if on_event is None:
+            return
+        try:
+            on_event(kind, payload)
+        except Exception:
+            pass
+
+    cfg = CONFIG["agents"][agent]
+    node = resolve_command(cfg.get("node", "node"))
+    script = cfg["exe"]
+    system = ROLE_SYSTEM.format(label=LABELS.get(agent, agent))
+    common = ["-p", "--output-format", "stream-json", "--include-partial-messages",
+              "-y", "--append-system-prompt", system]
+    if not HUB.streaming_on(agent):
+        common = [x for x in common if x not in ("stream-json", "--include-partial-messages")]
+        common.insert(common.index("--output-format") + 1, "json")
+    # --add-dir 是可变参数，必须放在最后，否则会把后面的 positional 吞掉
+    extra_dirs = HUB.grants_rw(agent)
+    dir_args = (["--add-dir"] + extra_dirs) if extra_dirs else []
+    forms = []
+    if session_id:
+        forms.append([node, script] + common + ["--resume", session_id] + dir_args)
+    forms.append([node, script] + common + ["--session-id", session_id or str(uuid.uuid4())] + dir_args)
+    argv_fallback = len(prompt) < 20000      # 提示词不长时保留 argv 形式兜底
+    last_err = ""
+    for form in forms:
+        sid = session_id if "--resume" in form else form[form.index("--session-id") + 1]
+        state = {"text": "", "result": "", "thinking": ""}
+        state["phase"] = None
+
+        def on_line(line, _state=state):
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                return
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                return
+            if obj.get("type") == "stream_event":
+                event = obj.get("event") or {}
+                etype = event.get("type")
+                if etype == "message_start":
+                    message = event.get("message") or {}
+                    _state["tools"] = {}
+                    _ev("llm_start", {"model": message.get("model")})
+                    usage = message.get("usage") or {}
+                    # 真 Anthropic：input 在 message_start 给。
+                    # workbuddy 系（hy4-preview）的 message_start 是**全零占位**
+                    # （实测 .verify/raw-codebuddy.jsonl：input_tokens=0），真值在
+                    # message_delta —— 所以这里只认真值（>0），别把占位 0 写进列里，
+                    # 那正是 CodeBuddy 链 `in_tokens` 恒 0 的成因。
+                    if usage.get("input_tokens"):
+                        _ev("llm_usage", {"in_tokens": usage.get("input_tokens")})
+                elif etype == "message_delta":
+                    usage = event.get("usage") or {}
+                    # 两处都取：缺失的一侧传 None，sink 侧 COALESCE 保留已有值。
+                    # 只取 output_tokens 会让 workbuddy 系的 input 永远丢（§5.2）。
+                    if usage.get("input_tokens") or usage.get("output_tokens") is not None:
+                        _ev("llm_usage", {"in_tokens": usage.get("input_tokens"),
+                                          "out_tokens": usage.get("output_tokens")})
+                elif etype == "message_stop":
+                    _ev("llm_end", {})
+                elif etype == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        on_text(f"\n[工具] {block.get('name') or 'tool'}\n")
+                        _state.setdefault("tools", {})[event.get("index")] = {
+                            "id": block.get("id"), "name": block.get("name")}
+                        _ev("tool_start", {"id": block.get("id"), "name": block.get("name")})
+                elif etype == "content_block_stop":
+                    info = _state.setdefault("tools", {}).pop(event.get("index"), None)
+                    if info:
+                        _ev("tool_end", {
+                            "id": info.get("id"), "name": info.get("name"),
+                            "input": _parse_tool_json(
+                                _state.setdefault("tool_json", {}).pop(event.get("index"), "")),
+                        })
+                elif etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "input_json_delta":
+                        # tool_use 的入参是**流式**到达的：content_block_start 时
+                        # content_block.input 还是空 {}，真值在 partial_json 里逐片拼。
+                        # 不接这一支，Edit 的 old_string/new_string 永远进不了库 ——
+                        # 截图里的红绿 diff 就没有数据源（这正是本轮的缺口）。
+                        _buf = _state.setdefault("tool_json", {})
+                        _idx = event.get("index")
+                        _buf[_idx] = _buf.get(_idx, "") + (delta.get("partial_json") or "")
+                    elif delta.get("type") == "text_delta" and delta.get("text"):
+                        if _state["phase"] != "text":
+                            _state["phase"] = "text"
+                            on_text("\n【正文】\n" if _state["thinking"] else "")
+                        _state["text"] += delta["text"]
+                        on_text(delta["text"])
+                    elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                        if _state["phase"] != "think":
+                            _state["phase"] = "think"
+                            on_text("【思考中】")
+                        _state["thinking"] += delta["thinking"]
+                        on_text(delta["thinking"])
+            elif obj.get("type") == "result":
+                for key in ("result", "text"):
+                    if isinstance(obj.get(key), str) and obj[key]:
+                        _state["result"] = obj[key]
+
+        rc, lines = stream_command(
+            form, DEFAULT_CWD, turn_timeout(agent), on_line, cancel, on_proc,
+            input_text=prompt,
+        )
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        text = (state["result"] or state["text"]).strip()
+        if not text and state["thinking"].strip():
+            text = ("（模型本轮只输出了思考内容，没有正文；把该成员的 max_tokens / 单次最大输出调大通常可解决）\n\n"
+                    + state["thinking"].strip())
+        if text:
+            return {"session_id": sid, "text": text}
+        last_err = "\n".join(lines[-3:])[-300:]
+        if argv_fallback:
+            rc, lines = stream_command(
+                form + [prompt], DEFAULT_CWD, turn_timeout(agent), on_line, cancel, on_proc
+            )
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            text = (state["result"] or state["text"]).strip()
+            if text:
+                return {"session_id": sid, "text": text}
+    raise RuntimeError(f"codebuddy 调用失败：{last_err}")
+
+
+def run_api_model(model_cfg, prompt, session_id, on_text, history, cancel=None, on_proc=None, on_event=None):
+    def _ev(kind, payload=None):
+        """API 模型没有工具调用，只发 llm 生命周期 + 正文（§5.2）。"""
+        if on_event is None:
+            return
+        try:
+            on_event(kind, payload)
+        except Exception:
+            pass
+
+    label = model_cfg["label"]
+    system = model_cfg.get("system_prompt") or ROLE_SYSTEM.format(label=label)
+    messages = list(history) + [{"role": "user", "content": prompt}]
+    overrides = cfg_agent(model_cfg["id"])
+    common = dict(
+        style=model_cfg["style"],
+        base_url=model_cfg["base_url"],
+        api_key=model_cfg["api_key"],
+        model=model_cfg["model"],
+        messages=messages,
+        system=system,
+        max_tokens=int(overrides.get("max_tokens") or model_cfg.get("max_tokens") or 1024),
+        timeout=http_timeout(model_cfg["id"]),
+        path=model_cfg.get("path"),
+        temperature=overrides.get("temperature"),
+    )
+    usage = {}
+    _ev("llm_start", {"model": model_cfg.get("model")})
+    if HUB.streaming_on(model_cfg["id"]):
+        text = call_model_stream(on_text=on_text, usage_out=usage, cancel=cancel, **common)
+    else:
+        text = call_model(usage_out=usage, **common)
+    # §5.2：provider 真值随 llm_end 一起收口。少了这一步，steps.llm_call 的
+    # in_tokens/out_tokens 永远是 NULL，turn 的 rollup（只读列）也就永远算不出 provider。
+    _ev("llm_end", {"in_tokens": usage.get("in_tokens"),
+                    "out_tokens": usage.get("out_tokens")})
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    return {"session_id": model_cfg["id"], "text": text}
+
+
+RUNNERS = {"claude": run_claude, "codex": run_codex, "codebuddy": run_codebuddy}
+
+
+# --------------------------------------------------------------------------- hub
+def db_size_bytes(path):
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        p = path + suffix
+        if os.path.exists(p):
+            total += os.path.getsize(p)
+    return total
+
+
+class Hub:
+    def __init__(self):
+        self.store = Store(DB_PATH)
+        self.subs = []
+        self.sub_lock = threading.Lock()
+        self.locks = {}
+        self.status = {}
+        self.cancel = {}
+        self.procs = {}
+        self.running = {}
+        self.current_images = {}
+        self.stop_epoch = 0
+        self.last_live = {}
+        self.last_live_len = {}
+        self.last_nexus_scan = None
+        self.last_error = None
+        self.trace_error = None      # trace 子系统最近一次写入失败（原先是静默吞掉的）
+        # 注：曾有 self.perm_turns 内存 dict 做 perm→turn 映射，全文无人读写且重启即失。
+        # 权限的落点只有一个：写入时定格的 perm_requests.turn_id 列（§4.3）。
+        for name in self.agent_names():
+            self.locks[name] = threading.Lock()
+            self.status[name] = {"state": "idle", "live": "", "since": None, "last": None}
+        self.relay_enabled = self.store.state_get("relay", "1") == "1"
+        self.max_depth = int(cfg_get("relay", {}).get("max_depth", 2))
+        self.sync_grants_from_config()
+        # §7.4 启动自愈：上次进程被强杀留下的 running 一律收敛，否则泳道图会越重启越脏
+        settled = self.store.settle_orphans(BOOT_MS)
+        if settled:
+            self.post("system", "all", "event", f"启动自愈：收敛 {settled} 个未完成轮次（上次进程异常退出）")
+
+    # -- 配置 ↔ config.json --------------------------------------------------
+    def sync_grants_from_config(self):
+        """config.json 的 permissions.grants 是唯一真源；启动/重载时同步进内存库。"""
+        section = CONFIG.setdefault("permissions", {})
+        grants = section.get("grants") or {}
+        if not grants:
+            current = self.store.list_grants(None)
+            if current:
+                restored = {}
+                for g in current:
+                    restored.setdefault(g["agent"], []).append({"path": g["path"], "mode": g["mode"]})
+                section["grants"] = restored
+                save_config()
+                grants = restored
+        self.store.replace_grants(grants)
+
+    def set_grant(self, agent, path, mode):
+        mode = "rw" if mode == "rw" else "ro"
+        grants = CONFIG.setdefault("permissions", {}).setdefault("grants", {})
+        items = [g for g in grants.get(agent, []) if g.get("path") != path]
+        items.append({"path": path, "mode": mode})
+        grants[agent] = items
+        save_config()
+        return self.store.set_grant(agent, path, mode)
+
+    def remove_grant(self, agent, path):
+        grants = CONFIG.setdefault("permissions", {}).setdefault("grants", {})
+        grants[agent] = [g for g in grants.get(agent, []) if g.get("path") != path]
+        if not grants[agent]:
+            grants.pop(agent, None)
+        save_config()
+        return self.store.remove_grant(agent, path)
+
+    def streaming_on(self, agent):
+        if not bool(cfg_get("streaming", {}).get("enabled", True)):
+            return False
+        return bool(cfg_agent(agent).get("stream", True))
+
+    def output_cap(self, agent):
+        per = int(cfg_agent(agent).get("max_output_chars") or 0)
+        if per:
+            return per
+        return int(cfg_get("max_output_chars", 0) or 0)
+
+    # -- 附件 ---------------------------------------------------------------
+    def upload_root(self):
+        rel = (cfg_get("uploads", {}) or {}).get("dir") or "uploads"
+        return os.path.join(HUB_DIR, rel)
+
+    def receive_upload(self, rel_name, data):
+        """保存一个拖入的文件并解析成文本，返回附件记录。"""
+        conf = cfg_get("uploads", {}) or {}
+        max_bytes = int(conf.get("max_mb", 100)) * 1024 * 1024
+        if len(data) > max_bytes:
+            raise ValueError(f"超过单文件上限 {conf.get('max_mb', 100)} MB")
+        safe = (rel_name or "file").replace("\\", "/").lstrip("/")
+        safe = re.sub(r"^[A-Za-z]:", "", safe)
+        parts = [p for p in safe.split("/") if p not in ("", ".", "..")]
+        if not parts:
+            raise ValueError("文件名无效")
+        safe = "/".join(parts)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target_dir = os.path.join(self.upload_root(), stamp, os.path.dirname(safe))
+        os.makedirs(target_dir, exist_ok=True)
+        target = os.path.join(target_dir, os.path.basename(safe))
+        with open(target, "wb") as fh:
+            fh.write(data)
+        result = extract_file(target, int(conf.get("max_text_chars_per_file", 20000)))
+        text = result.get("text") or ""
+        note = result.get("note")
+        if note and note not in text:
+            text = f"{text}\n{note}".strip()
+        return self.store.add_attachment(
+            os.path.basename(safe), safe, target, result.get("kind") or "binary", len(data), text
+        )
+
+    def attachments_block(self, atts):
+        """把附件拼成注入上下文的一段文本（带总量上限）。"""
+        conf = cfg_get("uploads", {}) or {}
+        total_cap = int(conf.get("max_total_chars", 120000))
+        lines = ["[附件] 用户拖入了以下内容，请把它们当作本次任务的材料："]
+        used = 0
+        for index, att in enumerate(atts, 1):
+            lines.append(
+                f"\n【附件 {index}】{att['name']}（{att['kind']}，{human_size(att['size'])}）"
+                f"\n本地路径：{att['path']}"
+            )
+            body = (att.get("text") or "").strip()
+            if not body:
+                continue
+            room = max(0, total_cap - used)
+            if room <= 0:
+                lines.append("（附件文本总量已达上限，其余内容未展开）")
+                break
+            snippet = body[:room]
+            used += len(snippet)
+            lines.append("----- 内容开始 -----\n" + snippet + "\n----- 内容结束 -----")
+            if len(body) > len(snippet):
+                lines.append(f"（该附件内容较长，已截断到 {len(snippet)} 字）")
+        return "\n".join(lines)
+
+    # -- agent registry -----------------------------------------------------
+    def agent_names(self):
+        return BUILTIN + [m["id"] for m in self.store.list_models()]
+
+    def agent_defs(self):
+        out = []
+        stats = self.store.agent_stats()
+        for name in BUILTIN:
+            flag = self.store.state_get(f"enabled:{name}")
+            enabled = (flag != "0") if flag is not None else CONFIG["agents"][name].get("enabled", True)
+            st = stats.get(name, {})
+            out.append(
+                {
+                    "name": name,
+                    "label": LABELS.get(name, name),
+                    "kind": "cli",
+                    "enabled": enabled,
+                    "removable": False,
+                    "session": self.store.get_session(name),
+                    "relay": self.store.state_get(f"relay:{name}", "1") != "0",
+                    "sent": st.get("sent", 0),
+                    "received": st.get("received", 0),
+                    "last_active": st.get("last_active"),
+                    "running_since": (self.running.get(name) or {}).get("started"),
+                    "native_memory": self.native_memory(name),
+                    "grants": self.store.list_grants(name),
+                    "live": (self.status.get(name) or {}).get("live", "")[-400:],
+                    "stream": self.streaming_on(name),
+                    "max_output_chars": int(cfg_agent(name).get("max_output_chars") or 0),
+                    "history_limit": self.history_limit(name),
+                    "turn_timeout_sec": turn_timeout(name),
+                    "history_override": cfg_agent(name).get("history_limit"),
+                    "timeout_override": cfg_agent(name).get("turn_timeout_sec"),
+                }
+            )
+        for model in self.store.list_models():
+            st = stats.get(model["id"], {})
+            out.append(
+                {
+                    "name": model["id"],
+                    "label": model["label"],
+                    "kind": model["style"],
+                    "enabled": model["enabled"],
+                    "removable": True,
+                    "session": model["model"],
+                    "base_url": model["base_url"],
+                    "api_key_masked": mask_key(model["api_key"]),
+                    "relay": self.store.state_get(f"relay:{model['id']}", "1") != "0",
+                    "sent": st.get("sent", 0),
+                    "received": st.get("received", 0),
+                    "last_active": st.get("last_active"),
+                    "running_since": (self.running.get(model["id"]) or {}).get("started"),
+                    "native_memory": False,
+                    "grants": self.store.list_grants(model["id"]),
+                    "live": (self.status.get(model["id"]) or {}).get("live", "")[-400:],
+                    "stream": self.streaming_on(model["id"]),
+                    "max_output_chars": int(cfg_agent(model["id"]).get("max_output_chars") or 0),
+                    "max_tokens": int(model.get("max_tokens") or 1024),
+                    "history_limit": self.history_limit(model["id"]),
+                    "turn_timeout_sec": turn_timeout(model["id"]),
+                    "history_override": cfg_agent(model["id"]).get("history_limit"),
+                    "timeout_override": cfg_agent(model["id"]).get("turn_timeout_sec"),
+                    "temperature": cfg_agent(model["id"]).get("temperature"),
+                }
+            )
+        return out
+
+    def find_agent(self, key):
+        key = (key or "").strip()
+        low = key.lower()
+        for d in self.agent_defs():
+            if d["name"] == key or d["label"].lower() == low or slug(d["label"]) == low:
+                return d
+        return None
+
+    # -- memory -------------------------------------------------------------
+    def native_memory(self, name):
+        """True = 用 CLI 自己的会话记忆；False（默认）= 记忆由本群聊窗口掌管。"""
+        if name not in BUILTIN:  # 自定义 API 模型始终由窗口供上下文
+            return False
+        flag = self.store.state_get(f"native_memory:{name}")
+        if flag is None:
+            return (cfg_get("memory_mode") or "hub") == "native"
+        return flag == "1"
+
+    def history_limit(self, agent=None):
+        """注入多少条历史；0 或负数 = 无上限（整段历史都注入）。成员级优先。"""
+        if agent:
+            per = cfg_agent(agent).get("history_limit")
+            if per is not None and per != "":
+                try:
+                    value = int(per)
+                    return 0 if value <= 0 else max(2, value)
+                except (TypeError, ValueError):
+                    pass
+        try:
+            value = int(cfg_get("history_limit"))
+        except (TypeError, ValueError):
+            return 20
+        if value <= 0:
+            return 0
+        return max(2, value)
+
+    def label_for(self, name):
+        if name == "user":
+            return "用户"
+        d = self.find_agent(name)
+        return d["label"] if d else name
+
+    def render_marks(self, text, ranges):
+        """把被高亮的片段包上 ★重要★ 标记，交给模型看。"""
+        if not ranges:
+            return text
+        out, pos = [], 0
+        for r in sorted(ranges, key=lambda x: x.get("start", 0)):
+            s = max(0, int(r.get("start", 0)))
+            e = min(len(text), int(r.get("end", 0)))
+            if s >= e or s < pos:
+                continue
+            out.append(text[pos:s])
+            out.append("【★重要★ " + text[s:e] + " ★】")
+            pos = e
+        out.append(text[pos:])
+        return "".join(out)
+
+    def history_block(self, agent, sender, text):
+        """把窗口里的历史消息拼成一段文本，作为模型上下文来源。"""
+        limit = self.history_limit(agent)
+        if limit == 0:
+            rows = [m for m in self.store.recent(None) if m["kind"] in ("user", "reply")]
+        else:
+            rows = [m for m in self.store.recent(limit * 4) if m["kind"] in ("user", "reply")]
+            rows = rows[-limit:]
+        while rows and rows[-1]["sender"] == sender and rows[-1]["text"] == text:
+            rows.pop()
+        if not rows:
+            return ""
+        lines = []
+        for m in rows:
+            target = "全体" if m["target"] == "all" else self.label_for(m["target"])
+            ranges = m.get("highlights") or []
+            body = self.render_marks(m["text"], ranges)
+            mark = "★重要★ " if (m.get("highlight") and not ranges) else ""
+            lines.append(
+                f"[{time.strftime('%H:%M:%S', time.localtime(m['ts']))}] "
+                f"{mark}{self.label_for(m['sender'])} → {target}: {body}"
+            )
+        head = (
+            "[群聊最近记录（这是你唯一的上下文来源，以这里的内容为准）]\n"
+            "注：被【★重要★ … ★】包住的部分是用户用鼠标选中的重点内容，必须优先满足；"
+            "整条前带 ★重要★ 的表示整条都重要。不得忽略或改写这些约束。\n"
+        )
+        return head + "\n".join(lines) + "\n\n"
+
+    def grants_block(self, agent):
+        """把该成员的工作区权限写进 prompt，并教它遇到阻碍怎么申请。"""
+        grants = self.store.list_grants(agent)
+        if not grants:
+            return "[工作区权限]\n当前没有设置准入限制。\n\n"
+        rw = [g["path"] for g in grants if g["mode"] == "rw"]
+        ro = [g["path"] for g in grants if g["mode"] == "ro"]
+        lines = ["[工作区权限准入]"]
+        if rw:
+            lines.append("可写：" + "、".join(rw))
+        if ro:
+            lines.append("只读：" + "、".join(ro))
+        lines.append("这些之外你没有写权限。若需要写入未授权的位置，不要假装写过，也不要绕过；")
+        lines.append("请在回复中原样输出这一行交给用户审批：[[PERM rw <完整路径>|<一句话原因]]")
+        lines.append("用户同意后你才会拿到权限。")
+        return "\n".join(lines) + "\n\n"
+
+    def grants_rw(self, agent):
+        return [g["path"] for g in self.store.list_grants(agent) if g["mode"] == "rw"]
+
+    def codex_sandbox_args(self, agent):
+        """按工作区授权构造 codex 沙箱参数；返回 (参数列表, 工作目录覆盖)。"""
+        rw = self.grants_rw(agent)
+        if rw:
+            args = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+            for extra in rw[1:]:
+                args += ["--add-dir", extra]
+            return args, rw[0]
+        cfg = CONFIG["agents"].get(agent, {})
+        sandbox = (cfg.get("sandbox") or "danger-full-access").strip()
+        if sandbox == "bypass":
+            return ["--dangerously-bypass-approvals-and-sandbox"], None
+        if sandbox == "workspace-write":
+            return ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"], None
+        if sandbox:
+            return ["--sandbox", sandbox], None
+        return [], None
+
+    def codex_turn_policy(self, agent):
+        """app-server turn/start 用的 sandboxPolicy + 工作目录。"""
+        rw = self.grants_rw(agent)
+        if rw:
+            return {"type": "workspaceWrite", "writableRoots": rw, "networkAccess": True}, rw[0]
+        cfg = CONFIG["agents"].get(agent, {})
+        mode = (cfg.get("sandbox") or "danger-full-access").strip()
+        if mode == "workspace-write":
+            return (
+                {"type": "workspaceWrite", "writableRoots": [DEFAULT_CWD], "networkAccess": True},
+                DEFAULT_CWD,
+            )
+        if mode == "read-only":
+            return {"type": "readOnly", "networkAccess": False}, DEFAULT_CWD
+        return {"type": "dangerFullAccess"}, DEFAULT_CWD
+
+    def extract_perm_requests(self, agent, reply):
+        """把回复里的 [[PERM ...]] 抽出来变成待审批申请，并从展示文本里去掉。"""
+        found = []
+        for m in PERM_RE.finditer(reply or ""):
+            mode = m.group(1).lower()
+            path = (m.group(2) or "").strip().strip('"').strip("'")
+            reason = (m.group(3) or "").strip() or "（未填写原因）"
+            if not path:
+                continue
+            req = self.store.add_perm_request(agent, path, mode, reason)
+            found.append(req)
+        cleaned = PERM_RE.sub("", reply or "").strip()
+        return cleaned, found
+
+    def request_permission(self, agent, path, mode, reason):
+        d = self.find_agent(agent)
+        if not d:
+            raise ValueError("未知成员")
+        if not path.strip():
+            raise ValueError("路径不能为空")
+        req = self.store.add_perm_request(d["name"], path.strip(), mode, reason or "")
+        self.post_perm_request(req)
+        return req
+
+    def post_perm_request(self, req):
+        label = self.label_for(req["agent"])
+        text = (
+            f"{label} 申请工作区权限：{'可读写' if req['mode'] == 'rw' else '只读'}\n"
+            f"路径：{req['path']}\n原因：{req['reason']}"
+        )
+        self.post(req["agent"], "all", "perm", text, ref=f"perm:{req['id']}")
+        self.trace_step(
+            req.get("turn_id"), "perm_request", "permission", "running",
+            {"path": req["path"], "mode": req["mode"], "reason": req["reason"]},
+        )
+
+    def resolve_permission(self, rid, approve):
+        req = self.store.get_perm_request(int(rid))
+        if not req:
+            raise ValueError("申请不存在")
+        if req["status"] != "pending":
+            raise ValueError("该申请已处理过")
+        req = self.store.resolve_perm_request(int(rid), approve)
+        self.trace_step(
+            req.get("turn_id"), "perm_resolve", "permission", "ok",
+            {"decision": "approved" if approve else "denied",
+             "path": req["path"], "mode": req["mode"]},
+        )
+        label = self.label_for(req["agent"])
+        if approve:
+            self.store.set_grant(req["agent"], req["path"], req["mode"])
+            self.post("system", req["agent"], "event", f"已批准 {label} 的权限申请：{req['path']}（{req['mode']}）")
+        else:
+            self.post("system", req["agent"], "event", f"已拒绝 {label} 的权限申请：{req['path']}")
+        self.broadcast({"type": "perms"})
+        self.broadcast({"type": "agents"})
+        return req
+
+    def set_agent_memory(self, name, native):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError("未知成员")
+        if d["kind"] != "cli":
+            raise ValueError("自定义 API 模型始终使用窗口记忆")
+        self.store.state_set(f"native_memory:{d['name']}", "1" if native else "0")
+        self.post(
+            "system", d["name"], "event",
+            f"{d['label']} 记忆来源切换为{'原生会话（删改窗口消息不会影响它）' if native else '群聊窗口（删改立即生效）'}",
+        )
+        self.broadcast({"type": "agents"})
+        return self.agent_defs()
+
+    def ensure_agent(self, name):
+        if name not in self.locks:
+            self.locks[name] = threading.Lock()
+            self.status[name] = {"state": "idle", "live": "", "since": None, "last": None}
+
+    # -- events -------------------------------------------------------------
+    def subscribe(self):
+        q = queue.Queue()
+        with self.sub_lock:
+            self.subs.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self.sub_lock:
+            if q in self.subs:
+                self.subs.remove(q)
+
+    def broadcast(self, event):
+        with self.sub_lock:
+            subs = list(self.subs)
+        for q in subs:
+            q.put(event)
+
+    def trace_step(self, turn_id, kind, name=None, status="ok", detail=None,
+                   in_tokens=None, out_tokens=None):
+        """trace 之外的地方（权限申请/批准等）挂 step 的唯一入口。turn 已关闭时的
+        开放式 step 会永远停在 running（泳道图上的假呼吸），所以这里对已终态的 turn
+        一律落成关闭式。"""
+        if not trace_enabled() or not turn_id:
+            return None
+        try:
+            if status == "running" and not self.store.is_turn_running(turn_id):
+                status = "ok"
+            row = self.store.add_step(turn_id, kind, name, status, detail, in_tokens, out_tokens)
+            self.broadcast({"type": "step", "turn_id": turn_id, "step": row})
+            return row["id"]
+        except Exception:
+            return None
+
+    def snapshot(self):
+        # UI 侧要的是"能看全历史 + 别把 payload 撑爆"：条数放宽到 1000，
+        # 超长正文（附件注入文本经常上万字）在列表里截断，DB/上下文里的原文不动。
+        msgs = self.store.recent(1000)
+        for m in msgs:
+            text = m.get("text") or ""
+            if len(text) > 8000:
+                m["text"] = text[:8000] + "\n…（界面预览已截断，完整内容仍在上下文里）"
+        return {
+            "messages": msgs,
+            "agents": self.agent_defs(),
+            "relay": self.relay_enabled,
+            "max_depth": self.max_depth,
+            "cwd": DEFAULT_CWD,
+            "styles": list(STYLES),
+            "context": self.store.state_get("context", "") or "",
+            "history_limit": self.history_limit(),
+            "activity": cfg_get("activity_bar") or {},
+            "perms": self.store.list_perm_requests("pending"),
+            "uploads": cfg_get("uploads") or {},
+            "limits": {
+                "turn_timeout_sec": cfg_get("limits.turn_timeout_sec", 420),
+                "max_output_chars": cfg_get("max_output_chars", 0),
+                "history_limit": self.history_limit(),
+            },
+            "health": self.health(),
+        }
+
+    def health(self):
+        counts = self.store.health_counts()
+        defs = self.agent_defs()
+        return {
+            "agents_total": len(defs),
+            "agents_enabled": sum(1 for a in defs if a["enabled"]),
+            "messages": counts["messages"],
+            "errors": counts["errors"],
+            "running": [
+                {"agent": name, "label": (self.find_agent(name) or {}).get("label", name), "started": info["started"]}
+                for name, info in self.running.items()
+            ],
+            "db_bytes": db_size_bytes(DB_PATH),
+            "nexus_last_scan": self.last_nexus_scan,
+            "last_error": self.last_error,
+            "trace_error": getattr(self, "trace_error", None),
+            "context_len": len(self.store.state_get("context", "") or ""),
+            "history_limit": self.history_limit(),
+        }
+
+    # -- messages -----------------------------------------------------------
+    def post(self, sender, target, kind, text, ref=None, retry_agent=None,
+             retry_prompt=None, display_text=None):
+        if display_text is None and kind == "user":
+            display_text = text
+        msg = self.store.add_message(
+            sender, target, kind, text, ref, retry_agent, retry_prompt, display_text
+        )
+        if msg:
+            self.broadcast({"type": "message", "message": msg})
+        return msg
+
+    def set_status(self, agent, state, live=None):
+        self.ensure_agent(agent)
+        st = self.status[agent]
+        st["state"] = state
+        now = time.time()
+        if live is not None:
+            st["live"] = live
+            # 逐字增量太密：满足"距上次≥0.08s"或"新增≥8字"才广播，其余只更新本地
+            grown = len(live) - self.last_live_len.get(agent, 0)
+            stream_cfg = cfg_get("streaming", {}) or {}
+            gap = max(0.0, float(stream_cfg.get("min_interval_ms", 80)) / 1000.0)
+            min_chars = max(1, int(stream_cfg.get("min_chars", 8)))
+            if state == "running" and now - self.last_live.get(agent, 0) < gap and grown < min_chars:
+                return
+            self.last_live[agent] = now
+            self.last_live_len[agent] = len(live)
+        st["since"] = time.time() if state == "running" else None
+        if state == "idle":
+            st["last"] = time.time()
+        self.broadcast({"type": "status", "agent": agent, **st})
+
+    # -- dispatch -----------------------------------------------------------
+    def dispatch(self, target, text, sender="user", depth=0, attachments=None, *,
+                 trace_id=None, parent_turn_id=None, trigger_kind="user",
+                 trigger_msg_id=None):
+        """新增的三个 trace 参数一律关键字传（§4.1：进 args 元组会静默落到 attachments 上）。
+
+        一次用户投递 = 1 个 trace_id：扇出的 N 个 turn 共用，接力继承父的。
+        """
+        if attachments is not None and not isinstance(attachments, list):
+            # 约定挡不住下一个人：位置错位之所以难查就是因为它不报错（§4.1 fail-fast）
+            raise TypeError(f"attachments 必须是 list，收到 {type(attachments).__name__}")
+        if target == "all":
+            names = [d["name"] for d in self.agent_defs() if d["enabled"]]
+        else:
+            d = self.find_agent(target)
+            if not d:
+                raise ValueError(f"未知成员：{target}")
+            names = [d["name"]]
+        if not names:
+            raise ValueError("没有启用中的成员")
+        if trace_id is None:
+            trace_id = uuid.uuid4().hex
+            if target == "all":
+                trigger_kind = "fanout"
+        for name in names:
+            self.ensure_agent(name)
+            threading.Thread(
+                target=self._run_agent,
+                args=(name, text, sender, target, depth, attachments or []),
+                kwargs={"trace_id": trace_id, "parent_turn_id": parent_turn_id,
+                        "trigger_kind": trigger_kind, "trigger_msg_id": trigger_msg_id,
+                        "epoch": self.stop_epoch},
+                daemon=True,
+            ).start()
+        return names
+
+    def _runner_for(self, name):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError(f"未知成员：{name}")
+        if d["kind"] == "cli":
+            return RUNNERS[name], None
+        return None, self.store.get_model(d["name"])
+
+    def _run_agent(self, agent, text, sender, target, depth, attachments=None,
+                   trace_id=None, parent_turn_id=None, trigger_kind="user",
+                   trigger_msg_id=None, epoch=None):
+        self.ensure_agent(agent)
+        with self.locks[agent]:
+            if epoch is not None and epoch != self.stop_epoch:
+                # 派出后被「停止键」作废：拿到锁就直接收工，不占用模型额度
+                self.post("system", agent, "event",
+                          f"{self.label_for(agent)} 本轮已被停止键取消（排队中）")
+                return
+            d = self.find_agent(agent)
+            label = d["label"] if d else agent
+            native = self.native_memory(agent)
+            session = self.store.get_session(agent) if native else None
+            others = [a["label"] for a in self.agent_defs() if a["name"] != agent]
+            shared = self.store.state_get("context", "") or ""
+            prompt = (
+                role_preamble(label, sender, target, others, shared)
+                + self.grants_block(agent)
+                + self.history_block(agent, sender, text)
+                + "[本次消息] " + text
+            )
+            cancel = threading.Event()
+            self.cancel[agent] = cancel
+            self.procs[agent] = None
+            self.current_images[agent] = [
+                a["path"] for a in (attachments or []) if a.get("kind") == "image" and a.get("path")
+            ]
+            self.set_status(agent, "running", "")
+            self.post("system", agent, "event", f"{label} 开始处理（深度 {depth}）")
+            live = []
+
+            def on_line(line):
+                if line is None or line == "":
+                    return
+                live.append(line)          # 保留原始片段（含换行），流式渲染才对
+                self.set_status(agent, "running", "".join(live)[-4000:])
+
+            def on_proc(proc):
+                self.procs[agent] = proc
+                self.track_child(proc.pid)
+
+            sink = None
+            turn_status, ended_ms, err_text = "ok", None, None
+            settled = False            # 成功路径是否已经一次性写全（§7.3：不许拆成两次 close）
+            reply, reqs = "", []
+
+            def emit(kind, payload=None):
+                """runner → TraceSink 的唯一事件通道。trace 写失败绝不影响主流程。"""
+                if sink is None:
+                    return
+                try:
+                    sink.on_event(kind, payload)
+                except Exception:
+                    pass
+
+            try:
+                runner, model_cfg = self._runner_for(agent)
+                try:
+                    sink = TraceSink(
+                        # agent 传**显示名**、agent_id 传路由 id（§3.1：model 是模型名，
+                        # 不能拿 agent id 兜底，否则「按模型聚合成本」这列永久废掉）
+                        self, label, agent_id=agent, depth=depth, trace_id=trace_id,
+                        parent_turn_id=parent_turn_id, trigger_kind=trigger_kind,
+                        trigger_msg_id=trigger_msg_id, trigger_by=sender,
+                        model=(model_cfg or {}).get("model") if model_cfg else None,
+                        session_id=session,
+                    )
+                except Exception:      # trace 建不起来就照常跑，不影响成员
+                    sink = None
+                self.running[agent] = {
+                    "started": time.time(),
+                    "turn_id": sink.id if sink else None,
+                    "trace_id": sink.trace_id if sink else trace_id,
+                }
+                if runner:
+                    result = runner(agent, prompt, session, on_line, cancel, on_proc, on_event=emit)
+                else:
+                    result = run_api_model(model_cfg, prompt, session, on_line, [], cancel,
+                                           on_proc, on_event=emit)
+                ended_ms = now_ms()        # runner 拿到 stream 结束的时刻（§7.3，不是落库时刻）
+                # —— 成功路径：先把回复落库拿到 id，再由**唯一一次** close 写全终态 ——
+                # 不能留到 finally：那里 reply 还不存在，out_chars/reply_msg_id 会丢；
+                # 也不能拆成两次 close：第二次会被 settle_turn 的 `status='running'` 守卫吞掉
+                # （静默，不报错 —— 这正是 out_chars 恒 0 的成因）。
+                reply, reqs = self.extract_perm_requests(agent, result["text"])
+                cap = self.output_cap(agent)
+                if cap and len(reply) > cap:
+                    reply = reply[:cap] + f"\n…（已按「单次最大输出」{cap} 字截断）"
+                reply_msg_id = None
+                if reply:
+                    msg = self.post(agent, target if target != "all" else "all", "reply", reply)
+                    if msg and msg.get("id"):
+                        reply_msg_id = msg["id"]
+                if sink is not None:
+                    # 空回复（本轮只有思考、无正文）也必须在这里收口，否则 turn 永久 running。
+                    # close 自身失败不能把已成功的本轮判成 error —— 交给 finally 兜底。
+                    try:
+                        sink.close("ok", end_ts=ended_ms, in_chars=len(prompt),
+                                   out_chars=len(reply), reply_msg_id=reply_msg_id)
+                        settled = True
+                    except Exception:
+                        pass
+            except Cancelled:
+                turn_status, ended_ms = "interrupted", now_ms()
+                self.set_status(agent, "idle")
+                self.post("system", agent, "event", f"{label} 本轮被手动中断")
+                return
+            except Exception as exc:  # noqa: BLE001
+                turn_status, ended_ms, err_text = "error", now_ms(), str(exc)[:2000]
+                self.set_status(agent, "idle")
+                self.last_error = f"[{time.strftime('%H:%M:%S')}] {label}: {exc}"
+                log_agent_error(label, exc, prompt, live)
+                self.post(
+                    agent, "all", "error", f"{label} 出错：{exc}",
+                    retry_agent=agent, retry_prompt=text,
+                )
+                return
+            finally:
+                try:
+                    _proc = self.procs.get(agent)
+                    if _proc is not None:
+                        self.untrack_child(_proc.pid)
+                except Exception:
+                    pass
+                if sink is not None and not settled:
+                    # 兜底路径：中断 / 出错 / 成功路径的 close 自己抛异常时才会走到这里。
+                    # 成功路径已一次性写全（settled），这里不再重复调用。
+                    # 中断时其下 running step 由 settle_turn 连带收敛为 skipped（§3.2）
+                    try:
+                        sink.close(turn_status, end_ts=ended_ms or now_ms(),
+                                   error_text=err_text, in_chars=len(prompt))
+                    except Exception:
+                        pass
+                self.running.pop(agent, None)
+                self.cancel.pop(agent, None)
+                self.procs.pop(agent, None)
+                self.current_images.pop(agent, None)
+            if d and d["kind"] == "cli" and native and result.get("session_id"):
+                self.store.set_session(agent, result["session_id"])
+            self.set_status(agent, "idle")
+            # reply / reqs 已在成功路径里产生并结算完毕（§7.3：一次 close 写全），这里只做后续动作
+            for req in reqs:
+                self.post_perm_request(req)
+            if reply:
+                self._maybe_relay(agent, label, reply, depth,
+                                  trace_id=sink.trace_id if sink else trace_id,
+                                  parent_turn_id=sink.id if sink else None)
+
+    def _maybe_relay(self, agent, label, reply, depth, trace_id=None, parent_turn_id=None):
+        if not self.relay_enabled:
+            return
+        if self.max_depth and depth >= self.max_depth:   # 0 = 无上限
+            return
+        if self.store.state_get(f"relay:{agent}", "1") == "0":
+            return
+        nxt = []
+        for token in MENTION_RE.findall(reply):
+            if token.lower() in ("all", "everyone"):
+                nxt.extend(a["name"] for a in self.agent_defs() if a["name"] != agent)
+                continue
+            d = self.find_agent(token)
+            if not d:
+                continue
+            if d["name"] != agent:
+                nxt.append(d["name"])
+        for name in dict.fromkeys(nxt):
+            target_label = self.find_agent(name)["label"]
+            self.post("system", name, "event", f"{label} 点名了 {target_label}，自动接力")
+            threading.Thread(
+                target=self.dispatch,
+                args=(name, f"{label} 说：\n{reply}", label, depth + 1),
+                # 接力继承同一条 trace，否则接力链断成两条独立 trace（§4.1：一律 kwargs）
+                kwargs={"trace_id": trace_id, "parent_turn_id": parent_turn_id,
+                        "trigger_kind": "relay"},
+                daemon=True,
+            ).start()
+
+    # -- management ---------------------------------------------------------
+    def reset_agent(self, name):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError("未知成员")
+        if d["kind"] == "cli":
+            self.store.clear_session(name)
+        else:
+            self.store.clear_history(name)
+            self.store.clear_session(name)
+        self.post("system", name, "event", f"{d['label']} 会话已重置，下一轮开新对话")
+
+    def set_agent_enabled(self, name, enabled):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError("未知成员")
+        if d["kind"] == "cli":
+            self.store.state_set(f"enabled:{name}", "1" if enabled else "0")
+            CONFIG.setdefault("agents", {}).setdefault(name, {})["enabled"] = bool(enabled)
+            save_config()
+        else:
+            model = self.store.get_model(name)
+            model["enabled"] = bool(enabled)
+            self.store.upsert_model(model)
+        self.post(
+            "system", name, "event",
+            f"{d['label']} 已{'加入' if enabled else '取消'}全体发送",
+        )
+        self.broadcast({"type": "agents"})
+        return self.agent_defs()
+
+    def add_model(self, payload):
+        style = (payload.get("style") or "").strip().lower()
+        if style not in STYLES:
+            raise ValueError("style 必须是 anthropic 或 openai")
+        label = (payload.get("label") or "").strip()
+        base_url = (payload.get("base_url") or "").strip()
+        model = (payload.get("model") or "").strip()
+        api_key = (payload.get("api_key") or "").strip()
+        if not (label and base_url and model):
+            raise ValueError("名称 / Base URL / 模型名 必填")
+        existing_id = (payload.get("id") or "").strip()
+        if not existing_id:
+            for old in self.store.list_models():
+                if (
+                    old["label"] == label
+                    and old["style"] == style
+                    and old["base_url"].rstrip("/") == base_url.rstrip("/")
+                    and old["model"] == model
+                ):
+                    existing_id = old["id"]
+                    break
+        if existing_id:
+            old = self.store.get_model(existing_id)
+            if not old:
+                raise ValueError("要修改的模型不存在")
+            api_key = api_key or old["api_key"]
+        item = {
+            "id": existing_id or uuid.uuid4().hex[:8],
+            "label": label,
+            "style": style,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "system_prompt": (payload.get("system_prompt") or "").strip(),
+            "path": (payload.get("path") or "").strip(),
+            "max_tokens": int(payload.get("max_tokens") or 1024),
+            "enabled": bool(payload.get("enabled", True)),
+        }
+        saved = self.store.upsert_model(item)
+        self.ensure_agent(saved["id"])
+        self.post("system", saved["id"], "event", f"已添加模型 {saved['label']}（{saved['style']} / {saved['model']}）")
+        self.broadcast({"type": "agents"})
+        return saved
+
+    def delete_model(self, model_id):
+        model = self.store.get_model(model_id)
+        if not model:
+            raise ValueError("模型不存在")
+        self.store.delete_model(model_id)
+        self.locks.pop(model_id, None)
+        self.status.pop(model_id, None)
+        self.post("system", "all", "event", f"已移除模型 {model['label']}")
+        self.broadcast({"type": "agents"})
+        return True
+
+    def set_relay(self, enabled):
+        self.relay_enabled = bool(enabled)
+        self.store.state_set("relay", "1" if self.relay_enabled else "0")
+        self.broadcast({"type": "relay", "relay": self.relay_enabled})
+
+    def stop_children(self):
+        """退出时结束所有还在跑的子进程，避免留下没人收结果的孤儿进程。"""
+        for name, proc in list(self.procs.items()):
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
+        save_child_pids([])
+
+    def track_child(self, pid):
+        pids = load_child_pids()
+        pids.append(int(pid))
+        save_child_pids(pids)
+
+    def untrack_child(self, pid):
+        save_child_pids([p for p in load_child_pids() if int(p) != int(pid)])
+
+    def set_agent_relay(self, name, enabled):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError("未知成员")
+        self.store.state_set(f"relay:{d['name']}", "1" if enabled else "0")
+        key = "agents" if d["kind"] == "cli" else "model_overrides"
+        CONFIG.setdefault(key, {}).setdefault(d["name"], {})["relay"] = bool(enabled)
+        save_config()
+        self.post("system", d["name"], "event", f"{d['label']} 的自动接力已{'开启' if enabled else '关闭'}")
+        self.broadcast({"type": "agents"})
+        return self.agent_defs()
+
+    def set_context(self, text):
+        self.store.state_set("context", text or "")
+        self.post("system", "all", "event", "共享上下文已更新（下一条消息起对全体生效）")
+        self.broadcast({"type": "context", "context": text or ""})
+        return text or ""
+
+    def interrupt(self, name):
+        d = self.find_agent(name)
+        if not d:
+            raise ValueError("未知成员")
+        flag = self.cancel.get(d["name"])
+        proc = self.procs.get(d["name"])
+        if not flag:
+            raise ValueError(f"{d['label']} 当前没有在跑的任务")
+        flag.set()
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return True
+
+    def stop_all(self, disable_relay=True):
+        """一键停止：掐掉所有在跑的轮次 + 作废排队中的轮次（可选关掉接力，防互相点名又跑起来）。"""
+        self.stop_epoch += 1                     # 排队中的轮次拿到锁后会发现自己过期
+        stopped, killed = [], []
+        for name, flag in list(self.cancel.items()):
+            if flag is None:
+                continue
+            try:
+                flag.set()
+                stopped.append(name)
+            except Exception:
+                pass
+            proc = self.procs.get(name)
+            if proc is not None:
+                try:
+                    proc.kill()
+                    killed.append(name)
+                except Exception:
+                    pass
+        relay_was = self.relay_enabled
+        if disable_relay and relay_was:
+            self.set_relay(False)
+        labels = [self.label_for(n) for n in stopped]
+        self.post(
+            "system", "all", "event",
+            f"已按停止键：中断 {len(stopped)} 个轮次"
+            + (f"（{'、'.join(labels)}）" if labels else "")
+            + ("；自动接力已关闭（状态栏可重新开启）" if disable_relay and relay_was else ""),
+        )
+        self.broadcast({"type": "agents"})
+        return {"stopped": stopped, "killed": killed, "relay_was": relay_was}
+
+    def retry(self, message_id):
+        msg = self.store.get(int(message_id))
+        if not msg or not msg.get("can_retry"):
+            raise ValueError("这条消息不能重试")
+        agent, prompt = msg["retry_agent"], msg["retry_prompt"]
+        self.post("system", agent, "event", f"手动重试上一轮（原错误 #{msg['id']}）")
+        names = self.dispatch(agent, prompt, sender="user", depth=0,
+                              trigger_msg_id=msg.get("id"))
+        return names
+
+    def nexus_orphans(self):
+        db = os.path.join(os.path.expanduser("~"), ".claudelink", "nexus.db")
+        if not os.path.exists(db):
+            return {"exists": False, "orphans": 0}
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        try:
+            orphan = con.execute(
+                """SELECT COUNT(*) FROM messages
+                    WHERE (read IS NULL OR read=0)
+                      AND to_agent NOT IN (SELECT id FROM agents)"""
+            ).fetchone()[0]
+            total = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        finally:
+            con.close()
+        return {"exists": True, "orphans": orphan, "messages": total}
+
+    def adopt_orphans(self):
+        """把投给已失效 agent id 的未读消息改挂到同名当前 agent（不删消息）。"""
+        db = os.path.join(os.path.expanduser("~"), ".claudelink", "nexus.db")
+        if not os.path.exists(db):
+            raise ValueError("nexus.db 不存在")
+        backup = os.path.join(HUB_DIR, f"nexus-backup-{time.strftime('%Y%m%d-%H%M%S')}.db")
+        try:
+            shutil.copy2(db, backup)
+        except OSError:
+            backup = "(备份失败，已跳过)"
+        con = sqlite3.connect(db, timeout=10)
+        con.execute("PRAGMA busy_timeout=10000")
+        adopted, skipped, details = 0, 0, []
+        try:
+            current = {}
+            for aid, role in con.execute("SELECT id, role FROM agents").fetchall():
+                current.setdefault(role, []).append(aid)
+            orphans = con.execute(
+                """SELECT id, to_agent, substr(content,1,120) FROM messages
+                    WHERE (read IS NULL OR read=0)
+                      AND to_agent NOT IN (SELECT id FROM agents)
+                    ORDER BY id"""
+            ).fetchall()
+            for mid, to_agent, preview in orphans:
+                role = self.store.nexus_role(to_agent)
+                targets = current.get(role or "", [])
+                if not role or not targets:
+                    skipped += 1
+                    details.append({"message_id": mid, "reason": f"无法判定归属（历史 id {str(to_agent)[:8]}）"})
+                    continue
+                con.execute("UPDATE messages SET to_agent=? WHERE id=?", (targets[-1], mid))
+                adopted += 1
+                details.append({"message_id": mid, "role": role, "to": targets[-1][:8], "preview": preview})
+            con.commit()
+        finally:
+            con.close()
+        self.post("system", "all", "event", f"孤儿消息收养：迁移 {adopted} 条，跳过 {skipped} 条（备份 {os.path.basename(backup)}）")
+        return {"adopted": adopted, "skipped": skipped, "details": details[:30], "backup": backup}
+
+    def clear_messages(self):
+        """清空全部上下文：消息 + 各方会话记忆 + 各模型历史；
+        保留公告板、系统提示词、准入授权、成员与模型配置。不写入任何新消息。"""
+        self.store.clear_messages()
+        self.store.clear_all_sessions()
+        self.store.clear_all_model_history()
+        # trace_reset 无条件发（trace.enabled=false 时也要发）——它是清缓存信号，不是 trace 数据。
+        # 客户端收到后：清空本地 trace store → 重拉 /api/trace（§7.5，清空后不重拉会留永久空洞）
+        self.broadcast({"type": "trace_reset"})
+        self.broadcast({"type": "cleared"})
+        return True
+
+    def edit_message(self, message_id, text):
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("内容不能为空")
+        msg = self.store.update_message(int(message_id), text)
+        if not msg:
+            raise ValueError("消息不存在")
+        if msg.get("highlight"):
+            # 文本变了，旧片段偏移会错位，直接清掉更安全
+            msg = self.store.clear_highlights(msg["id"])
+        self.broadcast({"type": "message_updated", "message": msg})
+        self.post("system", "all", "event", f"消息 #{msg['id']} 已改写，下一轮起模型看到的是新内容")
+        return msg
+
+    def delete_message(self, message_id):
+        msg = self.store.get(int(message_id))
+        if not msg:
+            raise ValueError("消息不存在")
+        if not self.store.delete_message(int(message_id)):
+            raise ValueError("删除失败")
+        self.broadcast({"type": "message_deleted", "id": int(message_id)})
+        self.post("system", "all", "event", f"消息 #{message_id} 已删除，下一轮起上下文不再包含它")
+        return True
+
+    def highlight_message(self, message_id, on, start=None, end=None):
+        """on=True 且给了 start/end：高亮该片段；on=True 无区间：整条高亮；on=False：清除该条全部高亮。"""
+        mid = int(message_id)
+        msg = self.store.get(mid)
+        if not msg:
+            raise ValueError("消息不存在")
+        if not on:
+            msg = self.store.clear_highlights(mid)
+        elif start is None or end is None:
+            text = msg["text"] or ""
+            msg = self.store.add_highlight(mid, 0, len(text), text)
+        else:
+            text = msg["text"] or ""
+            s = max(0, min(len(text), int(start)))
+            e = max(0, min(len(text), int(end)))
+            if e <= s:
+                raise ValueError("选中的范围无效")
+            if s == 0 and e >= len(text):
+                # 选中了整条 → 记为整条高亮（与「整条高亮」按钮同一种表示）
+                self.store.clear_highlights(mid)
+                msg = self.store.set_highlight(mid, True)
+            else:
+                msg = self.store.add_highlight(mid, s, e, text[s:e])
+        self.broadcast({"type": "message_highlighted", "message": msg})
+        return msg
+
+    # -- claudelink mirror --------------------------------------------------
+    def nexus_loop(self):
+        db = os.path.join(os.path.expanduser("~"), ".claudelink", "nexus.db")
+        while True:
+            try:
+                if os.path.exists(db):
+                    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+                    for aid, role in con.execute("SELECT id, role FROM agents").fetchall():
+                        self.store.nexus_map_upsert(aid, role)
+                    rows = con.execute(
+                        """SELECT m.id, m.content, fa.role, ta.role, m.created_at
+                             FROM messages m
+                             LEFT JOIN agents fa ON fa.id = m.from_agent
+                             LEFT JOIN agents ta ON ta.id = m.to_agent
+                            ORDER BY m.id DESC LIMIT 40"""
+                    ).fetchall()
+                    con.close()
+                    for mid, content, from_role, to_role, created in reversed(rows):
+                        ref = f"nexus:{mid}"
+                        if not self.store.mark_ref(ref):
+                            continue          # 清空上下文后不再重放同一条
+                        text = f"{from_role or '?'} → {to_role or '(已离线)'}：{content}"
+                        self.post("claudelink", "all", "claudelink", text, ref=ref)
+                    self.last_nexus_scan = time.time()
+            except Exception:
+                pass
+            time.sleep(3)
+
+
+def mask_key(key):
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return key[:4] + "…" + key[-4:]
+
+
+def deep_merge(base, patch):
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+HUB = Hub()
+
+
+# --------------------------------------------------------------------------- http
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ClaudeLinkHub/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else str(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False))
+
+    def _file(self):
+        """GET /api/file?path=…&line=N —— 只读文本直链（§27）。
+
+        **不用 file://**：Chrome 从 http 页面跳 file:// 会被拦掉，用户点了没反应。
+        安全边界见文件头 FILE_DENY_* 的说明。
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(self.path).query)
+        raw = (q.get("path") or [""])[0].strip().strip('"')
+        if not raw:
+            self._json({"ok": False, "error": "path required"}, 400)
+            return
+        target = os.path.realpath(os.path.expandvars(os.path.expanduser(raw)))
+        roots = (cfg_get("trace", {}) or {}).get("file_roots") or []
+        if isinstance(roots, str):
+            roots = [roots]
+        if not roots:
+            # 默认白名单：hub 项目目录 + agent 工作区。空 = 全盘放行是漏洞，
+            # 不放行则直链功能无意义；收紧/放宽都在 config.json 的 trace.file_roots。
+            roots = [HUB_DIR, DEFAULT_CWD]
+        if roots:
+            allowed = False
+            for root in roots:
+                if not isinstance(root, str) or not root:
+                    continue
+                real_root = os.path.realpath(os.path.expandvars(root))
+                if target == real_root or target.startswith(real_root + os.sep):
+                    allowed = True
+                    break
+            if not allowed:
+                self._json({"ok": False, "error": "路径不在 trace.file_roots 内"}, 403)
+                return
+        base = os.path.basename(target).lower()
+        parts = {part.lower() for part in target.replace("\\", "/").split("/") if part}
+        if (parts & FILE_DENY_PARTS or base in FILE_DENY_NAMES
+                or os.path.splitext(base)[1] in FILE_DENY_EXTS
+                or target.lower() in {p.lower() for p in HUB_SENSITIVE}):
+            self._json({"ok": False, "error": "该文件不可直链"}, 403)
+            return
+        if not os.path.isfile(target):
+            self._json({"ok": False, "error": "不是文件"}, 404)
+            return
+        try:
+            size = os.path.getsize(target)
+            with open(target, "rb") as fh:
+                blob = fh.read(FILE_MAX_BYTES)
+        except OSError as exc:
+            self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+            return
+        if b"\x00" in blob:
+            self._json({"ok": False, "error": "二进制文件，不直链"}, 415)
+            return
+        text = None
+        for enc in ("utf-8", "gbk"):
+            try:
+                text = blob.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            self._json({"ok": False, "error": "无法按 utf-8/gbk 解码"}, 415)
+            return
+        try:
+            want = int((q.get("line") or ["0"])[0])
+        except ValueError:
+            want = 0
+        self._json({"ok": True, "path": target, "size": size, "line": want,
+                    "total_lines": text.count("\n") + 1,
+                    "truncated": size > FILE_MAX_BYTES, "text": text})
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            try:
+                with open(os.path.join(WEB_DIR, "index.html"), "rb") as fh:
+                    self._send(200, fh.read(), "text/html; charset=utf-8")
+            except OSError:
+                self._send(404, "index.html missing", "text/plain; charset=utf-8")
+        elif path == "/api/state":
+            self._json(HUB.snapshot())
+        elif path == "/api/health":
+            payload = HUB.health()
+            payload["nexus"] = HUB.nexus_orphans()
+            self._json(payload)
+        elif path == "/api/context":
+            self._json({"ok": True, "context": HUB.store.state_get("context", "") or ""})
+        elif path == "/api/grants":
+            from urllib.parse import parse_qs, urlparse
+
+            agent = (parse_qs(urlparse(self.path).query).get("agent") or [""])[0]
+            self._json({"ok": True, "grants": HUB.store.list_grants(agent or None)})
+        elif path == "/api/perms":
+            self._json({"ok": True, "perms": HUB.store.list_perm_requests("pending")})
+        elif path == "/api/config":
+            self._json({"ok": True, "config": CONFIG})
+        elif path == "/api/debug/threads":
+            import traceback
+
+            frames = sys._current_frames()
+            out = {}
+            for thread in threading.enumerate():
+                frame = frames.get(thread.ident)
+                if frame is None:
+                    continue
+                stack = traceback.extract_stack(frame)
+                out[thread.name] = [f"{f.filename.split(os.sep)[-1]}:{f.lineno} {f.name}" for f in stack[-8:]]
+            self._json({"ok": True, "threads": out, "running": list(HUB.running.keys())})
+        elif path == "/api/trace":
+            # M1：limit 先写死 50（do_GET 第一行已吃掉 query string）
+            self._json({"ok": True, "traces": HUB.store.trace_list(50)})
+        elif path.startswith("/api/trace/"):
+            detail = HUB.store.trace_detail(path[len("/api/trace/"):])
+            self._json({"ok": True, **(detail or {"turns": [], "steps": {}})})
+        elif path == "/api/file":
+            # 只读文本直链（截图里的文件名要点得动）。query string 在 self.path 里还在。
+            self._file()
+        elif path == "/api/models":
+            models = [
+                {**m, "api_key": mask_key(m["api_key"]), "api_key_set": bool(m["api_key"])}
+                for m in HUB.store.list_models()
+            ]
+            self._json({"models": models})
+        elif path == "/api/stream":
+            self._stream()
+        else:
+            self._send(404, "not found", "text/plain; charset=utf-8")
+
+    def _stream(self):
+        q = HUB.subscribe()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    event = q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            HUB.unsubscribe(q)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        if path == "/api/upload":
+            from urllib.parse import parse_qs, unquote, urlparse
+
+            try:
+                name = unquote((parse_qs(urlparse(self.path).query).get("name") or ["file"])[0])
+                att = HUB.receive_upload(name, raw)
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"ok": True, "attachment": {
+                "id": att["id"], "name": att["name"], "kind": att["kind"],
+                "size": att["size"], "path": att["path"],
+                "preview": (att["text"] or "")[:400],
+            }})
+        raw = raw or b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return self._json({"ok": False, "error": "bad json"}, 400)
+        try:
+            return self._route(path, body)
+        except ValueError as exc:
+            return self._json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:  # noqa: BLE001
+            return self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+
+    def _route(self, path, body):
+        if path == "/api/send":
+            text = (body.get("text") or "").strip()
+            target = body.get("target") or "all"
+            ids = []
+            for item in body.get("attachments") or []:
+                try:
+                    ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            atts = [a for a in (HUB.store.get_attachment(i) for i in ids) if a]
+            if not text and not atts:
+                raise ValueError("消息为空")
+            full_text = text
+            if atts:
+                full_text = (text + "\n\n" if text else "") + HUB.attachments_block(atts)
+            msg = HUB.post("user", target, "user", full_text, display_text=text or "（仅附件）")
+            if atts and msg:
+                HUB.store.bind_attachments([a["id"] for a in atts], msg["id"])
+                HUB.broadcast({"type": "message", "message": HUB.store.get(msg["id"])})
+            names = HUB.dispatch(target, full_text, sender="user", depth=0, attachments=atts,
+                                 trigger_msg_id=(msg or {}).get("id"))
+            return self._json({"ok": True, "targets": names})
+        if path == "/api/relay":
+            HUB.set_relay(body.get("enabled", True))
+            return self._json({"ok": True, "relay": HUB.relay_enabled})
+        if path == "/api/reset":
+            HUB.reset_agent(body.get("agent") or "")
+            return self._json({"ok": True})
+        if path == "/api/clear":
+            HUB.clear_messages()
+            return self._json({"ok": True})
+        if path == "/api/interrupt":
+            HUB.interrupt(body.get("agent") or "")
+            return self._json({"ok": True})
+        if path == "/api/stop":
+            result = HUB.stop_all(disable_relay=bool(body.get("disable_relay", True)))
+            return self._json({"ok": True, **result})
+        if path == "/api/retry":
+            names = HUB.retry(body.get("message_id") or 0)
+            return self._json({"ok": True, "targets": names})
+        if path == "/api/context":
+            return self._json({"ok": True, "context": HUB.set_context(body.get("text") or "")})
+        if path == "/api/nexus/adopt":
+            return self._json({"ok": True, **HUB.adopt_orphans()})
+        if path == "/api/nexus/orphans":
+            return self._json({"ok": True, **HUB.nexus_orphans()})
+        if path == "/api/messages/edit":
+            msg = HUB.edit_message(body.get("id") or 0, body.get("text") or "")
+            return self._json({"ok": True, "message": msg})
+        if path == "/api/messages/delete":
+            HUB.delete_message(body.get("id") or 0)
+            return self._json({"ok": True})
+        if path == "/api/messages/highlight":
+            msg = HUB.highlight_message(
+                body.get("id") or 0,
+                bool(body.get("on", True)),
+                body.get("start"),
+                body.get("end"),
+            )
+            return self._json({"ok": True, "message": msg})
+        if path == "/api/agents/memory":
+            agents = HUB.set_agent_memory(body.get("agent") or "", bool(body.get("native", False)))
+            return self._json({"ok": True, "agents": agents})
+        if path == "/api/grants":
+            agent = body.get("agent") or ""
+            d = HUB.find_agent(agent)
+            if not d:
+                raise ValueError("未知成员")
+            action = (body.get("action") or "add").strip()
+            path_value = (body.get("path") or "").strip().strip('"')
+            if action == "remove":
+                grants = HUB.remove_grant(d["name"], path_value)
+                HUB.post("system", d["name"], "event", f"{d['label']} 的权限已移除：{path_value}")
+            else:
+                if not path_value:
+                    raise ValueError("路径不能为空")
+                mode = "rw" if (body.get("mode") or "rw").lower() == "rw" else "ro"
+                grants = HUB.set_grant(d["name"], path_value, mode)
+                HUB.post(
+                    "system", d["name"], "event",
+                    f"{d['label']} 获得{'可读写' if mode == 'rw' else '只读'}权限：{path_value}",
+                )
+            HUB.broadcast({"type": "agents"})
+            return self._json({"ok": True, "grants": grants})
+        if path == "/api/config":
+            patch = body.get("config") if isinstance(body.get("config"), dict) else body
+            patch = {k: v for k, v in (patch or {}).items() if k != "ok"}
+            if not patch:
+                raise ValueError("没有要写入的配置")
+            deep_merge(CONFIG, patch)
+            save_config()
+            reload_config()
+            HUB.max_depth = int(cfg_get("relay", {}).get("max_depth", 2))
+            HUB.sync_grants_from_config()
+            HUB.broadcast({"type": "config", "config": CONFIG})
+            HUB.broadcast({"type": "agents"})
+            return self._json({"ok": True, "config": CONFIG})
+        if path == "/api/perms/request":
+            req = HUB.request_permission(
+                body.get("agent") or "", body.get("path") or "",
+                body.get("mode") or "rw", body.get("reason") or "",
+            )
+            return self._json({"ok": True, "perm": req})
+        if path == "/api/perms/resolve":
+            req = HUB.resolve_permission(body.get("id") or 0, bool(body.get("approve", True)))
+            return self._json({"ok": True, "perm": req})
+        if path == "/api/agents/relay":
+            agents = HUB.set_agent_relay(body.get("agent") or "", bool(body.get("enabled", True)))
+            return self._json({"ok": True, "agents": agents})
+        if path == "/api/agents/toggle":
+            agents = HUB.set_agent_enabled(body.get("agent") or "", bool(body.get("enabled", True)))
+            return self._json({"ok": True, "agents": agents})
+        if path == "/api/models":
+            saved = HUB.add_model(body)
+            return self._json({"ok": True, "model": {**saved, "api_key": mask_key(saved["api_key"])}})
+        if path == "/api/models/delete":
+            HUB.delete_model(body.get("id") or "")
+            return self._json({"ok": True})
+        if path == "/api/models/test":
+            style = (body.get("style") or "").strip().lower()
+            if style not in STYLES:
+                raise ValueError("style 必须是 anthropic 或 openai")
+            text = call_model(
+                style,
+                body.get("base_url") or "",
+                body.get("api_key") or "",
+                body.get("model") or "",
+                [{"role": "user", "content": body.get("prompt") or "只回复两个字：可用"}],
+                system="",
+                max_tokens=64,
+                timeout=60,
+                path=body.get("path") or "",
+            )
+            return self._json({"ok": True, "reply": text})
+        return self._json({"ok": False, "error": "not found"}, 404)
+
+
+def main():
+    os.makedirs(DEFAULT_CWD, exist_ok=True)
+    threading.excepthook = _thread_excepthook
+    swept = sweep_stale_children()
+    if swept:
+        print(f"[hub] 清理上次残留的子进程: {swept}", flush=True)
+    atexit.register(HUB.stop_children)
+
+    def _graceful(signum, frame):
+        HUB.stop_children()
+        raise SystemExit(0)
+
+    for _sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if _sig is None:
+            continue
+        try:
+            signal.signal(_sig, _graceful)
+        except Exception:
+            pass
+    if cfg_get("nexus_mirror", True):
+        threading.Thread(target=HUB.nexus_loop, daemon=True).start()
+    if not HUB.store.recent(1):
+        HUB.post("system", "all", "event", "群聊中枢已启动：可以发给全体，也可以只跟某一方说话。")
+    host = cfg_get("host", "127.0.0.1")
+    port = int(cfg_get("port", 8787))
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    print(f"[hub] http://{host}:{port}  (cwd={DEFAULT_CWD})", flush=True)
+    print("[hub] Ctrl+C 退出", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

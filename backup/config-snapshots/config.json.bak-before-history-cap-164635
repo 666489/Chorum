@@ -1,0 +1,132 @@
+{
+  "_doc": {
+    "说明": "群聊中枢的唯一配置文件：准入 / 流式 / 输出上限 / 上下文 / 接力 / 界面 全部在这里。",
+    "热更新": "在窗口里改（如成员面板的流式开关、最大输出、准入）会写回本文件并立即生效；手工编辑本文件后，点顶部「重新加载数据」或重启中枢即生效。",
+    "无上限写法": "凡是数值型上限，填 0 就是无上限：limits.turn_timeout_sec=0（永不超时）、limits.max_output_chars=0 或成员级 max_output_chars=0（不截断）、relay.max_depth=0（接力不限层数，注意可能互相聊不停）。",
+    "路径写法": "Windows 路径用双反斜杠，例如 D:\\\\AI-GroupChat"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "workspace": {
+    "cwd": "D:\\AI-GroupChat"
+  },
+  "context": {
+    "history_limit": 0,
+    "memory_mode": "hub",
+    "shared_context": ""
+  },
+  "limits": {
+    "turn_timeout_sec": 1800,
+    "max_output_chars": 0
+  },
+  "streaming": {
+    "enabled": true,
+    "min_chars": 8,
+    "min_interval_ms": 80
+  },
+  "relay": {
+    "enabled": true,
+    "max_depth": 2
+  },
+  "claudelink": {
+    "mirror": true
+  },
+  "uploads": {
+    "dir": "uploads",
+    "max_items": 50,
+    "max_mb": 100,
+    "max_text_chars_per_file": 20000,
+    "max_total_chars": 120000,
+    "parser_python": ""
+  },
+  "permissions": {
+    "default": "unrestricted",
+    "grants": {
+      "codex": [
+        {
+          "path": "D:\\AI-GroupChat",
+          "mode": "rw"
+        }
+      ],
+      "codebuddy": [
+        {
+          "path": "D:\\AI-GroupChat",
+          "mode": "rw"
+        }
+      ]
+    }
+  },
+  "ui": {
+    "activity_bar": {
+      "default_panel": "agents",
+      "items": [
+        {
+          "id": "agents",
+          "title": "成员与模型",
+          "icon": "agents"
+        },
+        {
+          "id": "health",
+          "title": "运行视图",
+          "icon": "pulse"
+        },
+        {
+          "id": "share",
+          "title": "公告板",
+          "icon": "bookmark"
+        },
+        {
+          "id": "filter",
+          "title": "筛选与检索",
+          "icon": "search"
+        },
+        {
+          "id": "add-model",
+          "title": "添加模型",
+          "icon": "plug",
+          "action": "dialog"
+        }
+      ]
+    }
+  },
+  "agents": {
+    "claude": {
+      "enabled": true,
+      "label": "Claude",
+      "exe": "claude",
+      "settings_profile": "deepseek-f",
+      "settings_dir": "%USERPROFILE%\\.ccm\\settings",
+      "stream": true,
+      "max_output_chars": 0,
+      "turn_timeout_sec": null,
+      "history_limit": null,
+      "relay": false
+    },
+    "codex": {
+      "enabled": true,
+      "label": "Codex",
+      "exe": "codex",
+      "sandbox": "danger-full-access",
+      "stream": true,
+      "max_output_chars": 0,
+      "relay": false
+    },
+    "codebuddy": {
+      "enabled": false,
+      "label": "CodeBuddy",
+      "exe": "D:\\Workbuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy",
+      "node": "node",
+      "stream": true,
+      "max_output_chars": 0,
+      "max_turns": null,
+      "relay": false
+    }
+  },
+  "model_overrides": {
+    "49f01bdb": {
+      "relay": false
+    }
+  }
+}

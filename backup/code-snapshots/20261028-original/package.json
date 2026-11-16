@@ -1,0 +1,63 @@
+{
+  "name": "claudelink-hub",
+  "version": "0.2.0",
+  "description": "本地多智能体群聊中枢：自动识别本机已装的 AI Agent CLI，装配后以 Web UI / 终端版启动",
+  "keywords": [
+    "multi-agent",
+    "claude",
+    "codex",
+    "codebuddy",
+    "deepseek",
+    "cli",
+    "hub",
+    "ai-agent"
+  ],
+  "bin": {
+    "claudelink-hub": "bin/cli.js",
+    "claude-hub": "bin/cli.js"
+  },
+  "files": [
+    "bin/attach.js",
+    "bin/cli.js",
+    "bin/detect.js",
+    "bin/env.js",
+    "bin/everything.js",
+    "bin/postinstall.js",
+    "bin/registry.js",
+    "bin/setup.js",
+    "bin/util.js",
+    "hub.py",
+    "hub_pid.py",
+    "hub_tui.py",
+    "extract.py",
+    "web/index.html",
+    "docs/packaging.md",
+    "docs/agent-integration.md",
+    "docs/roundtable.md",
+    "README.md",
+    "config.example.json"
+  ],
+  "scripts": {
+    "prepublishOnly": "node scripts/check-secrets.js",
+    "check": "node scripts/check-secrets.js",
+    "postinstall": "node bin/postinstall.js",
+    "detect": "node bin/cli.js detect",
+    "doctor": "node bin/cli.js doctor",
+    "setup": "node bin/cli.js setup",
+    "start": "node bin/cli.js start",
+    "ui": "node bin/cli.js ui",
+    "selftest": "node scripts/selftest.js",
+    "smoke": "node scripts/smoke.js",
+    "pkg-e2e": "node scripts/pkg-e2e.js",
+    "ops": "npm run check && npm run selftest && npm run smoke && npm run pkg-e2e"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "license": "MIT"
+}

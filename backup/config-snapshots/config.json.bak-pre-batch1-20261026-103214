@@ -1,0 +1,224 @@
+{
+  "_doc": {
+    "说明": "群聊中枢的唯一配置文件：准入 / 流式 / 输出上限 / 上下文 / 接力 / 界面 全部在这里。",
+    "热更新": "在窗口里改（如成员面板的流式开关、最大输出、准入）会写回本文件并立即生效；手工编辑本文件后，点顶部「重新加载数据」或重启中枢即生效。",
+    "无上限写法": "凡是数值型上限，填 0 就是无上限：limits.turn_timeout_sec=0（永不超时）、limits.max_output_chars=0 或成员级 max_output_chars=0（不截断）、relay.max_depth=0（接力不限层数，注意可能互相聊不停）。",
+    "流式显示": "streaming.live_max_chars：流式期间广播的正文/思维链字数上限，0=不截断（默认，界面用滚轮查看）；给正数则保留末尾那段。",
+    "思维链": "trace.max_thinking_chars：把思维链存进「执行流程」时的字数上限，0=不截断（默认）。思维链只进 trace，不进 messages、不进模型上下文。",
+    "缓存命中": "context.cache_prefix：按会话冻结 prompt 前缀、只往后追加，好让 provider 的前缀缓存命中（原理效仿 deepseek harness）。enabled=false 则退回老写法（每轮重拼窗口，命中率极低）。reanchor_chars：前缀超过这个字数就重锚一次（重锚那轮付一次未命中，之后重新稳定）；0=永不重锚（prompt 会无上限增长，慎用）。命中率与四个 token 桶的口径见 README「缓存命中」。",
+    "冷启动": "context.cache_prefix.cold_start_minutes：界面上提示「本轮可能冷启动」的**时间阈值**（分钟，默认 10）。一轮里绝大部分 token 是 CLI 自己 --resume 重发的会话，缓存一冷就按未命中全额计费，所以值得提前提示。两个判据：① 距上次调用超过这个阈值 → 提示「可能」；② 该成员当前会话 id ≠ 上一轮用的会话 id（重置会话/换模型/换 profile）→ 提示「必冷」。5/30/10 分钟（Anthropic/OpenAI/DeepSeek）是各家的**保证下限**、不是淘汰时刻，所以 ① 只能说可能。本机三个 CLI 成员打的全是 DeepSeek，所以 10 就够；真要接原生 Anthropic/OpenAI 端点，再给那个成员单配 agents.<名>.cache_ttl_min（5 / 30）。0=关掉时间判据，只留会话变更判据。实测参考：同一会话隔 6.9 分钟第 1 次调用命中 86%，隔 10.7 小时只剩 5%（见 docs/缓存命中成本报告.md）。",
+    "usage_input_includes_cache": "agents.<名>.usage_input_includes_cache：**该端点**报的 input 是「总 prompt 量」（含命中）还是「未命中部分」。这是逐端点的属性，不是逐协议的 —— 实测 api.deepseek.com/anthropic 是 false（不含），而 CodeBuddy 的 Tencent 网关是 true（含），同是 Anthropic 协议结论相反。配错了命中率会差一倍（CodeBuddy 就因此被算成 50%，实际 99.8%）。自定义模型写在 model_overrides.<id> 下；不配则按风格兜底：anthropic→false、其余→true。",
+    "界面关闭键": "server.allow_shutdown：是否允许界面右上角「关闭」键结束中枢进程（默认 true）。它只监听 127.0.0.1，且关闭前会中断轮次、杀掉子进程、收尾数据库。",
+    "成员命令怎么找": "agents.<名>.exe 走环境变量：先读 CLAUDELINK_<名>（如 CLAUDELINK_CODEBUDDY），没设就读这里写的值（可写 %CLAUDELINK_X% 或绝对路径），最后才用代码里内置的默认路径。CLI 路径变了**改环境变量就行**，不用动本文件（改完要重启中枢）。解析出的裸名依次查：系统 PATH → %LOCALAPPDATA%\\OpenAI\\Codex\\bin\\*（版本目录，取最新）→ %APPDATA%\\npm → %USERPROFILE%\\.local\\bin → %ProgramFiles%\\nodejs → D:\\Node.js\\node_global。都找不到会在群里报错并写明怎么修（2026-09-26 codex 的 WinError 2 就是这套兜底救回来的）。",
+    "执行顺序": "dispatch.mode = sequential（默认，发给「全体」时按 dispatch.order 一个一个跑，后一个能看见前一个的回复）或 parallel（同时，彼此看不见本轮对方的话）；dispatch.order 是成员次序，界面「成员与模型 → 执行顺序」里用 ↑↓ 调，改完即生效。",
+    "成员模型": "agents.<名>.model / model_provider / settings_profile：在成员面板的「模型」里选，下一轮生效。claude 走 --settings <profile>（端点+密钥+模型）再加可选的 --model 覆盖；codex 走 -c model=… 覆盖，必要时再给 model_provider；codebuddy 走 --model。留空 = 跟随各自 CLI 自己的配置。dsh（DeepSeek Harness）的 headless profile 不接受任何参数，模型由 ~/.dsh/settings.yaml 的 agent-default-model 决定，所以它 model_capable=false、面板里不显示模型。",
+    "dsh 怎么送提示词": "headless 的 task 只能走命令行，而 Windows 命令行上限约 32KB、群里 prompt 常年 4 万字以上——所以中枢把整条任务塞进 DSH_TASK 环境变量，命令行只留短占位，需要 ~/.dsh/profiles/headless/cordis.patch.yml 里接一行（task: !!js process.env.DSH_TASK || ctx.headlessStartup.task）。没接上就退回「落盘 + 让它读文件」，能用但每轮多一次读文件调用；中枢只在第一次退回时提示一次。",
+    "路径写法": "Windows 路径用双反斜杠，例如 D:\\\\AI-GroupChat"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "allow_shutdown": true
+  },
+  "workspace": {
+    "cwd": "D:\\AI-GroupChat"
+  },
+  "context": {
+    "history_limit": 40,
+    "memory_mode": "hub",
+    "shared_context": "",
+    "cache_prefix": {
+      "enabled": true,
+      "reanchor_chars": 160000,
+      "cold_start_minutes": 10
+    }
+  },
+  "limits": {
+    "turn_timeout_sec": 1800,
+    "max_output_chars": 0
+  },
+  "streaming": {
+    "enabled": true,
+    "live_max_chars": 0,
+    "min_chars": 8,
+    "min_interval_ms": 80
+  },
+  "relay": {
+    "enabled": false,
+    "max_depth": 2
+  },
+  "dispatch": {
+    "mode": "auto",
+    "planner": "",
+    "order": [
+      "claude",
+      "codex",
+      "49f01bdb",
+      "codebuddy",
+      "dsh"
+    ]
+  },
+  "claudelink": {
+    "mirror": true
+  },
+  "trace": {
+    "enabled": true,
+    "max_thinking_chars": 0
+  },
+  "uploads": {
+    "dir": "uploads",
+    "max_items": 50,
+    "max_mb": 100,
+    "max_text_chars_per_file": 20000,
+    "max_total_chars": 120000,
+    "parser_python": ""
+  },
+  "permissions": {
+    "default": "unrestricted",
+    "grants": {
+      "codex": [
+        {
+          "path": "D:\\AI-GroupChat",
+          "mode": "rw"
+        },
+        {
+          "path": "C:\\Users\\Administrator\\Documents\\Codex\\2026-09-26\\bang\\outputs\\claudelink-hub",
+          "mode": "rw"
+        },
+        {
+          "path": "D:\\helloworld\\MASCOT",
+          "mode": "rw"
+        }
+      ],
+      "codebuddy": [
+        {
+          "path": "D:\\AI-GroupChat",
+          "mode": "rw"
+        },
+        {
+          "path": "C:\\Users\\Administrator\\Desktop\\",
+          "mode": "rw"
+        },
+        {
+          "path": "D:\\helloworld\\MASCOT\\_mascot_lab\\_tmp\\",
+          "mode": "rw"
+        },
+        {
+          "path": "D:\\helloworld\\MASCOT",
+          "mode": "rw"
+        },
+        {
+          "path": "D:\\MASCOT实验总览",
+          "mode": "rw"
+        },
+        {
+          "path": "D:\\Robot",
+          "mode": "rw"
+        }
+      ],
+      "49f01bdb": [
+        {
+          "path": "D:\\AI-GroupChat\\public",
+          "mode": "rw"
+        }
+      ]
+    }
+  },
+  "ui": {
+    "activity_bar": {
+      "default_panel": "conv",
+      "items": [
+        {
+          "id": "conv",
+          "title": "会话",
+          "icon": "conversations"
+        },
+        {
+          "id": "agents",
+          "title": "成员与模型",
+          "icon": "agents"
+        },
+        {
+          "id": "health",
+          "title": "运行视图",
+          "icon": "pulse"
+        },
+        {
+          "id": "share",
+          "title": "公告板",
+          "icon": "bookmark"
+        },
+        {
+          "id": "filter",
+          "title": "筛选与检索",
+          "icon": "search"
+        },
+        {
+          "id": "add-model",
+          "title": "添加模型",
+          "icon": "plug",
+          "action": "dialog"
+        }
+      ]
+    }
+  },
+  "agents": {
+    "claude": {
+      "enabled": true,
+      "label": "Claude",
+      "exe": "%CLAUDELINK_CLAUDE%",
+      "settings_profile": "deepseek-f",
+      "usage_input_includes_cache": false,
+      "model": "",
+      "settings_dir": "%CLAUDELINK_CLAUDE_SETTINGS_DIR%",
+      "stream": true,
+      "max_output_chars": 0,
+      "turn_timeout_sec": null,
+      "history_limit": null,
+      "relay": true
+    },
+    "codex": {
+      "enabled": true,
+      "label": "Codex",
+      "exe": "%CLAUDELINK_CODEX%",
+      "model": "",
+      "model_provider": "",
+      "sandbox": "danger-full-access",
+      "stream": true,
+      "max_output_chars": 0,
+      "relay": true
+    },
+    "codebuddy": {
+      "enabled": true,
+      "label": "CodeBuddy",
+      "exe": "%CLAUDELINK_CODEBUDDY%",
+      "node": "%CLAUDELINK_NODE%",
+      "model": "deepseek-v4.1-flash",
+      "usage_input_includes_cache": true,
+      "stream": true,
+      "max_output_chars": 50000,
+      "max_turns": null,
+      "relay": true,
+      "history_limit": 60
+    },
+    "dsh": {
+      "enabled": true,
+      "label": "DeepSeek Harness",
+      "exe": "%CLAUDELINK_DSH%",
+      "node": "%CLAUDELINK_NODE%",
+      "profile": "headless",
+      "model": "",
+      "model_capable": false,
+      "supports_native_memory": false,
+      "stream": true,
+      "max_output_chars": 0,
+      "relay": true
+    }
+  },
+  "model_overrides": {
+    "49f01bdb": {
+      "relay": true,
+      "max_tokens": 8192
+    }
+  }
+}

@@ -1,0 +1,61 @@
+"use strict";
+const fs=require("fs"),path=require("path"),cp=require("child_process"),net=require("net"),os=require("os");
+const {chromium}=require(process.env.CLAUDELINK_PLAYWRIGHT_MODULE||"playwright");
+const ROOT=path.resolve(__dirname,".."),DIR=fs.mkdtempSync(path.join(os.tmpdir(),"clh-browser-"));
+const artifact=process.env.CLAUDELINK_UI_ARTIFACTS||path.join(DIR,"artifacts");fs.mkdirSync(artifact,{recursive:true});
+const free=()=>new Promise(r=>{const s=net.createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>r(p));});});
+(async()=>{
+ const port=await free(),url="http://127.0.0.1:"+port;
+ const config={server:{host:"127.0.0.1",port,auth:true,allow_shutdown:true},workspace:{cwd:DIR},agents:{codex:{label:"验证成员",enabled:true,model:"fixture-small",effort:"low"}},permissions:{mode:"read-only",grants:{}},relay:{enabled:false},claudelink:{mirror:false},trace:{enabled:true}};
+ fs.writeFileSync(path.join(DIR,"config.json"),JSON.stringify(config));
+ const env={...process.env,CLAUDELINK_HOME:DIR,CLAUDELINK_CONFIG:path.join(DIR,"config.json"),CLAUDELINK_DB:path.join(DIR,"hub.db"),CLAUDELINK_RUNTIME_DIR:path.join(DIR,"instances"),PYTHONIOENCODING:"utf-8"};
+ const log=fs.openSync(path.join(artifact,"server.log"),"a");
+ const proc=cp.spawn(process.env.CLAUDELINK_PYTHON||"python",[path.join(__dirname,"ui_fixture.py")],{cwd:ROOT,env,windowsHide:true,stdio:["ignore",log,log]});
+ let browser;let failures=[];const passed=[];
+ function check(label,ok){if(!ok)throw new Error(label);passed.push(label);console.log("PASS "+label);}
+ try{
+  let ready=false;for(let i=0;i<80;i++){try{if((await fetch(url+"/api/health")).ok){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,100));}check("fixture started",ready);
+  browser=await chromium.launch({...(process.env.CLAUDELINK_BROWSER?{executablePath:process.env.CLAUDELINK_BROWSER}:{}),headless:true});
+  const page=await browser.newPage({viewport:{width:1440,height:940}});const errors=[];page.on("pageerror",e=>errors.push(e.message));
+  page.on("dialog",d=>d.accept());
+  await page.goto(url,{waitUntil:"networkidle"});await page.locator('#conn').filter({hasText:'已连接'}).waitFor();
+  check("web initialized and SSE connected",await page.locator('#activity button').count()>0);
+  check("no startup JavaScript errors",errors.length===0);
+  await page.locator('#text').fill('这是浏览器端到端验证主题');await page.locator('#send').click();
+  await page.waitForFunction(()=>document.querySelector('#log')?.innerText.includes('独立结论：'));
+  check("chat sends and reply arrives through SSE",true);
+  await page.locator('[data-wb-view="tools"]').click();await page.locator('#workbenchPanel summary').first().waitFor();
+  await page.locator('#workbenchPanel summary').first().click();check("tool input and result visible",(await page.locator('#workbenchPanel').innerText()).includes('read_file')&&(await page.locator('#workbenchPanel').innerText()).includes('fixture-result.txt'));
+  await page.locator('[data-wb-view="thinking"]').click();await page.waitForFunction(()=>document.querySelector('#workbenchPanel')?.innerText.includes('先核对原始目标'));
+  check("reasoning summary visible",true);
+  await page.locator('[data-wb-view="memory"]').click();await page.locator('[data-wb-new-memory]').click();
+  await page.locator('#wbMemoryKind').selectOption('long');await page.locator('#wbMemoryText').fill('界面回归记忆：保持原始目标');await page.locator('dialog button[type=submit]').click();
+  await page.waitForFunction(()=>document.querySelector('#workbenchPanel')?.innerText.includes('界面回归记忆'));
+  check("long memory saved and displayed",true);
+  await page.locator('[data-wb-forget]').first().click();await page.waitForFunction(()=>!document.querySelector('#workbenchPanel')?.innerText.includes('界面回归记忆'));
+  check("memory deletion reflected",true);
+  await page.locator('#wbWork').click();await page.locator('#wbWorkTopic').fill('读取本地验证工件并完成检查点');await page.locator('dialog button[type=submit]').click();
+  await page.waitForFunction(()=>document.querySelector('#workbenchPanel')?.innerText.includes('fixture-result.txt')&&document.querySelector('#workbenchPanel')?.innerText.includes('done'),{timeout:10000});
+  check("planner once and worker complete through real UI",true);
+  await page.screenshot({path:path.join(artifact,'web-tasks.png'),fullPage:true});
+  await page.locator('#wbRound').click();await page.locator('#wbRoundTopic').fill('围绕原始目标，第一句给出独立结论');await page.locator('#wbRounds').fill('1');await page.locator('dialog button[type=submit]').click();
+  await page.waitForFunction(()=>document.querySelector('#log')?.innerText.includes('独立结论：'));
+  check("roundtable can start from web",true);
+  await page.waitForTimeout(500);
+  await page.evaluate(()=>openMemberPanel('codex'));await page.locator('#mpEffort').waitFor();await page.locator('#mpEffort').selectOption('high');
+  await page.waitForTimeout(250);
+  const state=await page.evaluate(()=>getJSON('/api/state'));check("effort applied from member panel",state.agents.find(a=>a.name==='codex').effort==='high');
+  await page.locator('#mpClose').click();
+  check("cache absence not represented as zero percent",(await page.locator('#status').innerText()).includes('未报告'));
+  await page.locator('[data-wb-view="discussion"]').click();
+  await page.route('**/api/send',r=>r.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'fixture unavailable'})}));
+  await page.locator('#text').fill('发送失败必须保留的草稿');await page.locator('#send').click();
+  await page.waitForFunction(()=>document.querySelector('#text').value==='发送失败必须保留的草稿');
+  check("failed send preserves draft",await page.locator('#text').inputValue()==='发送失败必须保留的草稿');
+  await page.unroute('**/api/send');
+  await page.screenshot({path:path.join(artifact,'web-workspace.png'),fullPage:true});
+  check("no browser runtime errors after operations",errors.length===0);
+  fs.writeFileSync(path.join(artifact,'report.json'),JSON.stringify({passed,errors},null,2));
+ }catch(e){failures.push(e.stack);console.error(e.stack);fs.writeFileSync(path.join(artifact,'failure.json'),JSON.stringify({passed,failures},null,2));process.exitCode=1;}
+ finally{if(browser)await browser.close();proc.kill();fs.closeSync(log);console.log('Artifacts: '+artifact);}
+})();
