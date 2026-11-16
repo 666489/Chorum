@@ -1,0 +1,104 @@
+{
+  "_doc": {
+    "说明": "claudelink-hub 配置文件。detect/setup 会按本机已安装的 Agent 自动维护 agents 与 dispatch.order。",
+    "上限": "数值型上限填 0 = 无上限；留空 = 跟随全局。",
+    "手动改完": "重启中枢或点界面「重新加载数据」生效。"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "allow_shutdown": true,
+    "auth": true
+  },
+  "workspace": {
+    "cwd": ""
+  },
+  "detect": {
+    "_doc": {
+      "extra_roots": "额外搜索根（数组，默认空）。只浅扫一层；系统目录根与网络盘会被跳过。",
+      "everything": "可选加速层：用 Everything 的 es.exe 按文件名精确定位 Agent（仅 Windows）。enabled=false 整体关闭；auto/true=找到 es.exe 才生效；roots 为空且 allow_full_scan=false 时不做任何查询（默认不扫全盘）。找不到/超时/报错一律静默回退。"
+    },
+    "extra_roots": [],
+    "everything": {
+      "enabled": "auto",
+      "exe": "",
+      "roots": [],
+      "allow_full_scan": false,
+      "timeout_ms": 3000,
+      "max_results": 50
+    }
+  },
+  "agents": {
+    "codex": {
+      "transport": "exec",
+      "effort": "",
+      "sandbox": "workspace-write"
+    }
+  },
+  "permissions": {
+    "mode": "workspace-write",
+    "grants": {}
+  },
+  "relay": {
+    "enabled": false,
+    "max_depth": 2,
+    "max_fanout": 4
+  },
+  "dispatch": {
+    "mode": "sequential",
+    "order": [],
+    "planner": ""
+  },
+  "limits": {
+    "turn_timeout_sec": 420,
+    "max_output_chars": 0
+  },
+  "queue": {
+    "_doc": {
+      "max_parallel": "全局同时运行的轮次上限（默认 2）。同一成员永远只跑一轮，多的排队。",
+      "max_depth": "接力跳数上限，0 = 不额外限制（仍受 relay.max_depth 约束）。",
+      "fail_streak": "某成员连续失败多少次进入冷却。",
+      "cooldown_sec": "冷却时长（秒），期间 @all 会跳过它。"
+    },
+    "max_parallel": 2,
+    "max_depth": 0,
+    "fail_streak": 3,
+    "cooldown_sec": 300
+  },
+  "budget": {
+    "_doc": {
+      "max_tokens": "单个会话的 token 预算，0 = 不限制（按估算 token 计）。",
+      "max_turns": "单个会话的轮次预算，0 = 不限制。",
+      "warn_ratio": "用到预算的多少比例开始预警。"
+    },
+    "max_tokens": 0,
+    "max_turns": 0,
+    "max_wall_clock_sec": 0,
+    "warn_ratio": 0.8
+  },
+  "context": {
+    "history_limit": 16,
+    "max_tokens": 0,
+    "max_history_chars": 12000,
+    "cache_prefix": {
+      "reanchor_chars": 16000
+    }
+  },
+  "streaming": {
+    "min_interval_ms": 80,
+    "min_chars": 8,
+    "live_max_chars": 0
+  },
+  "trace": {
+    "enabled": true,
+    "max_thinking_chars": 0,
+    "file_roots": []
+  },
+  "claudelink": {
+    "mirror": true
+  },
+  "tools": {
+    "enabled": true,
+    "max_steps": 6
+  }
+}

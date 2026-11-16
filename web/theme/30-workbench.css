@@ -1,0 +1,393 @@
+/* =============================================================================
+   30-workbench.css — 工作台视图（#workbenchBar / #workbenchPanel / .wb-dialog）
+   -----------------------------------------------------------------------------
+   设计说明：
+   1) 原 workbench.css 自带另一套蓝灰（#111b2a→#17202d 渐变 + #2c3b4f 描边），
+      和聊天区并排时像两个产品；这里全部改用 --nc-* token，不再出现裸 hex。
+   2) 表面自下而上只走四级：panel = canvas、bar = surface、card = raised、
+      dialog = overlay；描边只用 line / line-2 / line-3，靠透明度而不是给每层配灰。
+   3) 语义分工与聊天区一致：可点 = 冰蓝（nav 选中、主按钮、聚焦环），
+      待处理/执行中 = 金（任务块左竖线、步数状态），失败 = 危险红。
+   4) 只改颜色/描边/阴影/圆角/等宽字体；display、尺寸、内外距一律保持原样。
+   ========================================================================== */
+
+/* ── 一、顶部工具栏 ─────────────────────────────────────────────────────── */
+
+/* 原问题：bar 是 100deg 的 #111b2a→#17202d 斜向渐变 + #2c3b4f 底边，与主 header 的平涂不同源
+   → 去掉原 shorthand 里的 background-image（不改这一行，渐变会继续生效）+ surface 平涂，
+   与 header 用同一套 surface + 顶缘光，两栏并排时是同一块材质 */
+#workbenchBar {
+  background-color: var(--nc-surface);
+  background-image: none;
+  border-bottom-color: var(--nc-line);
+  box-shadow: var(--nc-inner-hi);
+}
+
+/* 原问题：品牌名 #e6f2ff 比正文更冷更亮，像另一个系统的 logo → 回到正文色 */
+.wb-brand { color: var(--nc-text); }
+
+/* 原问题：版本号 #90c9eb 是亮冰蓝，比标题还抢眼，且不是可点元素 → 退到三级灰，只保留等宽 */
+.wb-brand span { color: var(--nc-text-3); font-family: var(--nc-mono); }
+
+/* 原问题：nav 按钮是 #202c3c 实底 + #34455a 边，五个灰蓝方块在 bar 上排成一条亮带
+   → 透明底 + 透明边，只做文字；三档明度：默认 text-2 → hover text → 选中 ice */
+#workbenchBar nav button {
+  background-color: transparent;
+  border-color: transparent;
+  color: var(--nc-text-2);
+  border-radius: var(--nc-r-sm) var(--nc-r-sm) 0 0;
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease);
+}
+/* 原问题：原样式里 nav 根本没有 hover 态，鼠标扫过去没有任何反馈；而通用按钮 hover 会把标签涂成一块 raised 方块
+   → hover 只提字色到 text 并显式清掉底色/描边，把「最亮」留给选中态，标签始终是标签而不是按钮 */
+#workbenchBar nav button:hover {
+  color: var(--nc-text);
+  background-color: transparent;
+  border-color: transparent;
+}
+
+/* 原问题：选中态是 #253c54 蓝块（比未选中的方块更亮一档），语义只是「更深的灰」
+   → 冰蓝 wash 底 + ice 字 + 底部 2px ice 指示条，与活动栏的选中语汇同一套 */
+#workbenchBar nav button.on {
+  background-color: var(--nc-ice-wash);
+  /* 审计：选中态文字原本是 ice，而 #targets 的选中胶囊是 ice-hi，同一个「选中」两种亮度 → 统一 ice-hi */
+  color: var(--nc-ice-hi);
+  border-color: transparent;
+  box-shadow: inset 0 -2px 0 var(--nc-ice);
+}
+
+/* 原问题：bar 里的按钮是 #202c3c 实块，比它所在的 bar 还亮，一排按钮像贴纸
+   → 下沉一格 + 发丝线；hover 才抬到 raised（与主 header 按钮完全同一套） */
+#workbenchBar button {
+  background-color: var(--nc-sunken);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line);
+  border-radius: var(--nc-r-sm);
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease);
+}
+#workbenchBar button:hover {
+  background-color: var(--nc-raised);
+  border-color: var(--nc-line-3);
+  color: var(--nc-text);
+}
+
+/* 原问题：主按钮是淡蓝 #b2dded 实底，与聊天区发送键的冰蓝不是同一个蓝 → 冰蓝实底 + ice-ink 字 */
+#workbenchBar button.primary {
+  background-color: var(--nc-ice);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-ink);
+  font-weight: 600;
+}
+#workbenchBar button.primary:hover {
+  background-color: var(--nc-ice-hi);
+  border-color: var(--nc-ice-hi);
+  color: var(--nc-ice-ink);
+}
+
+/* ── 二、工作台容器与分区标题 ───────────────────────────────────────────── */
+
+/* 原问题：面板底 #111720 比 canvas 还多一层蓝，和 #log 的底色接不上
+   → 直接落回 canvas，工作台与聊天流共用同一张画布 */
+#workbenchPanel {
+  background-color: var(--nc-canvas);
+  color-scheme: dark;
+}
+
+/* 原问题：分区标题没有显式色，靠继承（偏蓝的 #e2eaf4） → 正文色，作为这一屏的起点 */
+.wb-section-head h2 { color: var(--nc-text); }
+
+/* 原问题：说明文字 #8e9fb5 与卡片 meta 同色，标题下的一行读起来像注释 → text-2，仍承载信息 */
+.wb-section-head p { color: var(--nc-text-2); }
+
+/* 原问题：面板内按钮是 #202c3c（第三种灰） → raised + line-2；hover 才转冰蓝，与 morebtn 同语汇 */
+#workbenchPanel button,
+.wb-actions button {
+  background-color: var(--nc-raised);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease);
+}
+#workbenchPanel button:hover,
+.wb-actions button:hover {
+  color: var(--nc-ice);
+  border-color: var(--nc-ice-line);
+}
+
+/* 原问题：卡片里的primary 只靠 #b2dded 与次按钮区分，在同一层里太软 → 与 bar 主按钮同一块冰蓝 */
+.wb-actions .primary,
+#workbenchPanel button.primary {
+  background-color: var(--nc-ice);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-ink);
+  font-weight: 600;
+}
+.wb-actions .primary:hover,
+#workbenchPanel button.primary:hover {
+  background-color: var(--nc-ice-hi);
+  border-color: var(--nc-ice-hi);
+  color: var(--nc-ice-ink);
+}
+
+/* ── 三、卡片 ───────────────────────────────────────────────────────────── */
+
+/* 原问题：卡片 #17212d + #2b3d51 边，是蓝灰家族，与聊天气泡的 --panel2 不是一块材质
+   → raised 面 + line 发丝边 + r-lg + 一级阴影，与消息气泡同层 */
+.wb-card {
+  background-color: var(--nc-raised);
+  border-color: var(--nc-line);
+  border-radius: var(--nc-r-lg);
+  /* 审计：同级容器 .msg / .box 都带 inner-hi 顶缘微光，卡片没有 → 补上，让 raised 这一层同材质 */
+  box-shadow: var(--nc-shadow-1), var(--nc-inner-hi);
+}
+
+/* 原问题：卡片标题靠继承正文色，和下面的说明同重 → 正文色，让层级只由 small 的降级来完成 */
+.wb-card-title { color: var(--nc-text); }
+
+/* 原问题：small（wf_ 编号 / 状态 / done）与 meta 同为 #8e9fb5，卡片头部两行灰分不开
+   → small 退到 text-3（状态是注释，不承载正文信息） */
+.wb-card small { color: var(--nc-text-3); }
+
+/* 原问题：summary 只有 cursor 与 flex，颜色跟正文一样亮，可折叠卡片看着像已展开的正文
+   → 正文色；展开三角降到 text-3，避免三角形比标题还显眼 */
+.wb-card summary { color: var(--nc-text); }
+.wb-card summary::marker { color: var(--nc-text-3); }
+
+/* 原问题：meta 是 12px #8e9fb5，编号与步数不等宽，竖排时数字左右抖 → text-2 + 等宽数位 */
+.wb-meta {
+  color: var(--nc-text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 原问题：结果/代码块是裸等宽字，直接铺在卡片底上，和下面的 meta 分不开
+   → 沉到 sunken + line 发丝边 + r-sm，形成「卡片里的一层」；字体归到 --nc-mono
+   内距是「文字与自己的容器」的呼吸，不是外部布局位移，team-lead 已单独批准这一处加 padding */
+.wb-card pre {
+  background-color: var(--nc-sunken);
+  border: 1px solid var(--nc-line);
+  border-radius: var(--nc-r-sm);
+  color: var(--nc-text-2);
+  font-family: var(--nc-mono);
+  padding: 6px 9px;
+}
+
+/* ── 四、任务块 ─────────────────────────────────────────────────────────── */
+
+/* 原问题：任务块左竖线 #5683a9 是交互蓝、底 #121c27 又是另一档蓝灰，语义（待处理）和颜色（可点）错位
+   → 金色左竖线（注意色）+ sunken 底 + 右侧小圆角，与卡片的 raised 面拉开三层 */
+.wb-task {
+  background-color: var(--nc-sunken);
+  border-left-color: var(--nc-gold);
+  border-radius: 0 var(--nc-r-sm) var(--nc-r-sm) 0;
+}
+
+/* 原问题：步数/状态 #8fc6db 是浅蓝，与 nav 选中、按钮 hover 撞色；且原来所有状态同一色，语义被摊平
+   → 纯文字按状态取色（与聊天区 .tstat 同族）。钩子是 workbench.js 输出并经 stSlug 白名单收口的
+   data-st（done / running / error / paused / blocked / other 六个值，由 JS 侧 stSlug 白名单产出），
+   这里一律精确属性选择器，不做通配匹配。
+   配色只分三桶，不设第四桶：绿 = 做完了；金 = 没做完、需要你看一眼（在跑 / 卡住等依赖 / 人为暂停）；
+   红 = 坏了（真失败）。红在全站只留给真失败，否则警示力会被摊薄 */
+.wb-task span {
+  color: var(--nc-text-3);
+  font-variant-numeric: tabular-nums;
+}
+.wb-task span[data-st="done"] { color: var(--nc-ok); }
+.wb-task span[data-st="running"] { color: var(--nc-gold); }
+.wb-task span[data-st="error"] { color: var(--nc-danger); }
+/* 暂停不是「坏了」，是「没做完、等你回来点继续」；聊天区把 interrupted/timeout 也归金，
+   同一语义左右两区必须同色 → gold，与 running 同桶（金 = 需要你看一眼） */
+.wb-task span[data-st="paused"] { color: var(--nc-gold); }
+/* 等依赖/等人同样属于「需要主动处理」而非失败 → 金，与 running 同桶（blocked 已在 stSlug 白名单内，规则生效） */
+.wb-task span[data-st="blocked"] { color: var(--nc-gold); }
+/* 兜底：后端出现任何未收录的状态（stSlug 归到 other）时回到三级灰，不猜语义 */
+.wb-task span[data-st="other"] { color: var(--nc-text-3); }
+
+/* 原问题：任务说明 #a0b1c6 比正文还亮，一眼先看到说明而不是任务名 → text-2，回到附属层级 */
+.wb-task p { color: var(--nc-text-2); }
+
+/* 原问题：任务内的结果块与任务底同色，pre 里外糊成一片 → 再深一档到 canvas（卡中卡的最内层）
+   这里不再描边：金竖线 + 任务内边 + 代码框三根线并排会把 15px 的内距挤成噪点 */
+.wb-task pre {
+  background-color: var(--nc-canvas);
+  border-color: transparent;
+  border-radius: var(--nc-r-xs);
+  color: var(--nc-text-2);
+  font-family: var(--nc-mono);
+  padding: 6px 9px;
+}
+
+/* ── 五、空态与错误 ─────────────────────────────────────────────────────── */
+
+/* 原问题：空态 #8e9fb5 与正文抢注意力，一段「还没有记录」占了大半屏 → 三级灰，明确它是旁白 */
+.wb-empty { color: var(--nc-text-3); }
+
+/* 原问题：卡片内错误段是 #f4a5a5（偏粉），与 danger 不同族 → danger；它是给人读的正文级信息
+   审计：聊天区同样「正文级错误文字」的 .errline 用的是 danger-hi，这里用 danger 低一档 → 统一 danger-hi */
+.wb-error { color: var(--nc-danger-hi); }
+
+/* 原问题：顶部错误条是 #40252b 底 + #69414b 边（脏玫瑰），与 banner 又是两种红
+   → canvas 上叠 10% danger + danger 线 + danger-hi 字，与聊天区 banner 完全同源 */
+#wbError {
+  background-color: color-mix(in srgb, var(--nc-danger) 10%, var(--nc-canvas));
+  border-bottom-color: var(--nc-danger-line);
+  color: var(--nc-danger-hi);
+}
+
+/* ── 六、记忆检索工具条 ─────────────────────────────────────────────────── */
+
+/* 原问题：检索框只有 min-width，底色是 UA 的浅色（深色里像挖了个洞） → sunken + line-2 + 正文色 */
+.wb-memory-tools input {
+  background-color: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  caret-color: var(--nc-ice);
+  transition: border-color var(--nc-t-fast) var(--nc-ease),
+              box-shadow var(--nc-t-base) var(--nc-ease);
+}
+
+/* ── 七、对话框 ─────────────────────────────────────────────────────────── */
+
+/* 原问题：dialog 用 #17212d（比卡片还低一档）+ #3c5269 边，压在遮罩上浮不起来
+   → overlay 面 + line-2 + r-xl + 三级阴影，与聊天区弹窗同一块材质 */
+.wb-dialog {
+  background-color: var(--nc-overlay);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-xl);
+  box-shadow: var(--nc-shadow-3);
+  color-scheme: dark;
+}
+
+/* 原问题：遮罩 #060a11b8 偏灰、blur(3px) 太轻，后面的工作台轮廓还在动 → 更深的冷黑 + 6px 模糊 */
+.wb-dialog::backdrop {
+  background: var(--nc-scrim);
+  backdrop-filter: blur(6px);
+}
+
+/* 原问题：标题靠继承 #e2eaf4 → 正文色；头部的 × 原是一个 #25374b 实块按钮，比标题还重
+   → 透明底 + 三级灰，hover 才转冰蓝 */
+.wb-dialog h2 { color: var(--nc-text); }
+.wb-dialog .wb-dialog-head button {
+  background-color: transparent;
+  border-color: transparent;
+  color: var(--nc-text-3);
+}
+.wb-dialog .wb-dialog-head button:hover {
+  background-color: var(--nc-ice-wash);
+  border-color: transparent;
+  color: var(--nc-ice);
+}
+
+/* 原问题：表单 label 是 #b9cadd，和输入值同亮，读不出哪个是标签 → text-2 */
+.wb-dialog label { color: var(--nc-text-2); }
+
+/* 原问题：勾选项与字段标签同色，一行行「Claude / Codex」选起来分不清是标签还是可选项
+   → 提到正文色（可选成员是内容），并且勾选框跟随冰蓝 */
+.wb-dialog .wb-check { color: var(--nc-text); }
+.wb-dialog .wb-check input { accent-color: var(--nc-ice); }
+
+/* 原问题：输入框是 #101923 + #3a5068 边，边比底亮太多，像贴了蓝色胶带 → sunken + line-2，聚焦给冰蓝环 */
+.wb-dialog input,
+.wb-dialog textarea,
+.wb-dialog select {
+  background-color: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  caret-color: var(--nc-ice);
+  transition: border-color var(--nc-t-fast) var(--nc-ease),
+              box-shadow var(--nc-t-base) var(--nc-ease);
+}
+.wb-dialog input:focus,
+.wb-dialog textarea:focus,
+.wb-dialog select:focus,
+.wb-memory-tools input:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+  box-shadow: 0 0 0 2px var(--nc-ice-wash);
+}
+
+/* 原问题：placeholder 是浏览器默认灰，在 sunken 上偏亮、抢输入值的位置 → text-4（只做占位提示）
+   审计：text-4 在 sunken 上只有 3.4:1，而这里的占位符是「需要完成什么，交付哪些实际结果」这类
+   指令性文字；聊天区所有 placeholder 都是 text-3 → 统一 text-3（6.8:1） */
+.wb-dialog input::placeholder,
+.wb-dialog textarea::placeholder,
+.wb-memory-tools input::placeholder { color: var(--nc-text-3); }
+
+/* 原问题：fieldset 是 #34475c 蓝灰方框、legend 无样式，分组看起来像多画了一个框 → line 发丝框 + text-3 分组标签 */
+.wb-dialog fieldset { border-color: var(--nc-line); border-radius: var(--nc-r-sm); }
+.wb-dialog legend { color: var(--nc-text-3); }
+
+/* 原问题：对话框按钮是 #25374b + #415c79（同一屏里第三种灰蓝） → 浮层内再抬一档 overlay-2，hover 只提边
+   层叠说明：.wb-dialog 里也有一组 .wb-actions（取消 / 开始），与上面的 .wb-actions button 特异度相同，
+   靠「本条写在后面」才拿到 overlay-2。改这一组时不要把它挪到 .wb-actions 之前，否则弹窗内会退成 raised */
+.wb-dialog button {
+  background-color: var(--nc-overlay-2);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  transition: background-color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease);
+}
+.wb-dialog button:hover { border-color: var(--nc-line-3); }
+
+/* 原问题：提交键是淡蓝 #b2dded 实底，与「开始」这个动作的分量不匹配 → 冰蓝实底 + ice-ink 字 */
+.wb-dialog button.primary {
+  background-color: var(--nc-ice);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-ink);
+  font-weight: 600;
+}
+.wb-dialog button.primary:hover {
+  background-color: var(--nc-ice-hi);
+  border-color: var(--nc-ice-hi);
+  color: var(--nc-ice-ink);
+}
+
+/* ── 八、圆桌参与者行 ───────────────────────────────────────────────────── */
+
+/* 原问题：参与者行的 select/input 是 UA 浅色底，一行一个白洞，行的节奏全断 → 与对话框字段同一套下沉面 */
+.wb-participant select,
+.wb-participant input {
+  background-color: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+}
+
+/* 原问题：「移除」与「添加角色实例」同为次按钮色，删行的手滑成本一样 → 悬停时转 danger，其余交给统一按钮语汇 */
+.wb-participant button:hover {
+  color: var(--nc-danger-hi);
+  border-color: var(--nc-danger-line);
+  background-color: var(--nc-danger-wash);
+}
+
+/* =====================================================================
+   验收修正（一致性审计 §2 的 F-03 / A-05）
+   ===================================================================== */
+
+/* 审计 A-05：同一张卡里，`wf_8f21 · running` 是灰的，而任务行的 `running · 2 步` 是金 ——
+   同一串状态字两种颜色。JS 已给 meta 状态挂上同一个 data-st 钩子，这里与任务行共用一套映射。 */
+.wb-meta span[data-st] { color: var(--nc-text-3); }
+.wb-meta span[data-st="done"] { color: var(--nc-ok); }
+.wb-meta span[data-st="running"],
+.wb-meta span[data-st="blocked"],
+.wb-meta span[data-st="paused"] { color: var(--nc-gold); }
+.wb-meta span[data-st="error"] { color: var(--nc-danger); }
+
+/* 审计 F-03：任务失败时左竖线仍是金（金=待处理），只有右侧文字变红，读起来像「还在跑」。
+   `:has()` 在 Chromium 105+ 可用，本项目已要求 111+（color-mix），所以可上。
+   顺手把左竖线做成「全状态」而非「默认金 + 失败例外」——竖线是这一块的唯一状态色块，
+   必须和右边的状态字同源，否则同一行里两种说法。 */
+.wb-task:has(span[data-st="done"])    { border-left-color: var(--nc-ok); }
+.wb-task:has(span[data-st="running"]) { border-left-color: var(--nc-gold); }
+.wb-task:has(span[data-st="paused"])  { border-left-color: var(--nc-gold); }
+.wb-task:has(span[data-st="blocked"]) { border-left-color: var(--nc-gold); }
+.wb-task:has(span[data-st="error"])   { border-left-color: var(--nc-danger); }
+.wb-task:has(span[data-st="other"])   { border-left-color: var(--nc-line-3); }

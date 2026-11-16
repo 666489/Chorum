@@ -1,0 +1,107 @@
+/* Chorum 工作台样式层。
+   配色直接复用页面 :root 变量（--bg / --panel / --line / --muted…），
+   以前这里写的是另一套蓝灰（#111b2a / #202c3c），跟主界面明显是两个应用拼在一起。 */
+[hidden]{display:none!important}
+
+#workbenchBar{
+  min-height:56px;display:flex;align-items:center;gap:16px;padding:9px 18px;flex-wrap:wrap;
+  background:var(--panel,#171a21);border-bottom:1px solid var(--line,#2a2f3a);
+}
+.wb-brand{display:flex;align-items:center;gap:8px;font-weight:700;letter-spacing:.3px;color:var(--text,#e6e8ee)}
+.wb-chip{font:11px/1 ui-monospace,Consolas,monospace;color:var(--muted,#98a0b3);background:var(--panel2,#1e222b);
+  border:1px solid var(--line,#2a2f3a);border-radius:999px;padding:3px 8px}
+.wb-dot{width:8px;height:8px;border-radius:50%;background:#3f8f5c;box-shadow:0 0 0 3px #3f8f5c22}
+.wb-dot.busy{background:#c9a227;box-shadow:0 0 0 3px #c9a22733;animation:wbPulse 1s ease-in-out infinite}
+.wb-dot.off{background:#8a4a4a}
+@keyframes wbPulse{50%{opacity:.45}}
+
+#workbenchBar nav{display:flex;gap:2px;flex:1;flex-wrap:wrap}
+#workbenchBar button{font:inherit;background:transparent;color:var(--muted,#98a0b3);border:1px solid transparent;
+  border-radius:7px;padding:6px 12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+#workbenchBar nav button:hover{color:var(--text,#e6e8ee);background:var(--panel2,#1e222b)}
+#workbenchBar nav button.on{color:#cfe8ff;background:#243349;border-color:#39506e}
+#workbenchBar button:focus-visible,#workbenchPanel button:focus-visible,.wb-dialog button:focus-visible{
+  outline:2px solid #6ea8fe;outline-offset:1px}
+.wb-actions{display:flex;gap:8px;align-items:center}
+.wb-actions button,#workbenchPanel .wb-section-head button{background:var(--panel2,#1e222b);color:#c3d3e5;
+  border:1px solid var(--line,#2a2f3a);border-radius:7px;padding:6px 12px;cursor:pointer;font:inherit}
+.wb-actions button:hover,#workbenchPanel .wb-section-head button:hover{border-color:#48607e;color:#e6f2ff}
+.wb-actions .primary,#workbenchBar .primary{background:#b2dded;color:#0d1c25;border-color:#b2dded;font-weight:600}
+.wb-actions .primary:hover{background:#c6e9f6;color:#0d1c25}
+
+#workbenchPanel{flex:1;min-height:0;overflow:auto;padding:24px 30px 40px;background:var(--bg,#0f1115)}
+.wb-loading{color:var(--muted,#98a0b3);padding:28px 4px;font-size:13px}
+.wb-section-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px;gap:20px}
+.wb-section-head h2{margin:0;font-size:20px;font-weight:600}
+.wb-section-head p{color:var(--muted,#98a0b3);margin:6px 0 0;font-size:13px;line-height:1.6}
+.wb-count{font:12px/1 ui-monospace,monospace;color:var(--muted,#98a0b3);border:1px solid var(--line,#2a2f3a);
+  border-radius:999px;padding:5px 10px}
+
+.wb-card{border:1px solid var(--line,#2a2f3a);background:var(--panel,#171a21);padding:16px 18px;border-radius:10px;
+  margin:0 0 12px;max-width:1080px}
+.wb-card details,.wb-card summary{outline:none}
+.wb-card-title{font-weight:600;font-size:15px;display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.wb-card small,.wb-meta{color:var(--muted,#98a0b3);font-size:12px}
+.wb-meta{margin:8px 0}
+.wb-card pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 ui-monospace,Consolas,'Microsoft YaHei',monospace;
+  color:#c3d0e0;max-height:520px;overflow:auto;margin:8px 0 0}
+.wb-card summary{cursor:pointer;display:flex;justify-content:space-between;gap:12px;padding:2px 0}
+.wb-card summary:hover{color:#cfe8ff}
+[data-st]{border-radius:5px;padding:1px 6px;font-size:11px;border:1px solid transparent}
+[data-st="done"]{color:#7fd6a2;background:#7fd6a21a;border-color:#7fd6a233}
+[data-st="running"]{color:#8fc6db;background:#8fc6db18;border-color:#8fc6db30}
+[data-st="error"]{color:#f4a5a5;background:#f4a5a51a;border-color:#f4a5a533}
+[data-st="paused"]{color:#e3c37b;background:#e3c37b18;border-color:#e3c37b30}
+[data-st="blocked"]{color:#e3c37b;background:#e3c37b18;border-color:#e3c37b30}
+[data-st="other"]{color:var(--muted,#98a0b3)}
+
+.wb-task{margin-top:12px;padding:11px 14px;border-left:2px solid #4a6c8f;background:var(--panel2,#1e222b);border-radius:0 6px 6px 0}
+.wb-task span{float:right;color:#8fc6db;font-size:12px}
+.wb-task p{color:#a9b7c9;font-size:13px;margin:6px 0}
+
+.wb-empty{padding:44px 6px;color:var(--muted,#98a0b3);font-size:14px}
+.wb-hint{margin-top:8px;font-size:12.5px;color:#7d8798}
+.wb-tip{margin:10px 0 0;font-size:12px;color:var(--muted,#98a0b3)}
+
+.wb-error,#wbError{color:#f4a5a5}
+#wbError{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:9px 18px;
+  background:#3a2228;border-bottom:1px solid #5d3a43;font-size:13px}
+#wbError button{background:transparent;border:0;color:#f4a5a5;font-size:17px;line-height:1;cursor:pointer;padding:0 4px}
+
+.wb-memory-tools{display:flex;gap:9px;margin-bottom:16px;flex-wrap:wrap}
+.wb-memory-tools input{min-width:240px}
+
+.wb-code{position:relative}
+.wb-code .wb-copy{position:absolute;top:4px;right:4px;background:#22303f;color:#b8c9dd;border:1px solid #34455a;
+  border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;opacity:0;transition:opacity .12s}
+.wb-code:hover .wb-copy,.wb-copy:focus-visible{opacity:1}
+
+.wb-dialog{width:min(680px,calc(100vw - 40px));max-height:calc(100vh - 60px);overflow:auto;
+  background:var(--panel,#171a21);color:var(--text,#e6e8ee);border:1px solid var(--line,#2a2f3a);
+  border-radius:13px;padding:22px;box-shadow:0 24px 80px #000a}
+.wb-dialog::backdrop{background:#05080db8;backdrop-filter:blur(3px)}
+.wb-dialog-head{display:flex;align-items:center;justify-content:space-between}
+.wb-dialog h2{font-size:18px;margin:0 0 14px}
+.wb-dialog label{display:flex;flex-direction:column;gap:6px;margin:11px 0;color:#b9c6d6;font-size:13px}
+.wb-dialog input,.wb-dialog textarea,.wb-dialog select,.wb-memory-tools input{
+  background:var(--bg,#0f1115);color:#deebf8;border:1px solid #33445a;border-radius:6px;padding:8px 9px;font:inherit}
+.wb-dialog input:focus,.wb-dialog textarea:focus,.wb-dialog select:focus,.wb-memory-tools input:focus{
+  border-color:#5a86b8;outline:none}
+.wb-dialog textarea{resize:vertical}
+.wb-dialog .wb-check{display:inline-flex;flex-direction:row;align-items:center;gap:6px;margin-right:16px}
+.wb-dialog fieldset{border:1px solid var(--line,#2a2f3a);border-radius:8px;padding:6px 12px 10px}
+.wb-dialog legend{color:var(--muted,#98a0b3);font-size:12px;padding:0 4px}
+.wb-dialog .wb-actions{justify-content:flex-end;margin-top:18px}
+.wb-dialog button{background:#24354a;color:#d8e8f8;border:1px solid #3c5273;border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
+.wb-dialog button.primary{background:#b2dded;color:#0d1c25;border-color:#b2dded;font-weight:600}
+.wb-dialog button:disabled{opacity:.6;cursor:progress}
+.wb-participant{display:flex;gap:8px;margin:8px 0}
+.wb-participant select,.wb-participant input{min-width:0;flex:1}
+
+@media (max-width:1000px){
+  #workbenchBar{gap:8px;padding:9px 12px}
+  .wb-brand{width:100%}
+  #workbenchPanel{padding:16px}
+  #sidebar{width:255px;flex-basis:255px}
+}
+@media (prefers-reduced-motion:reduce){.wb-dot.busy{animation:none}}

@@ -1,0 +1,623 @@
+/* =============================================================================
+   20-chat.css — 聊天区（主区 / 消息流 / 思维链 / 步骤流 / 输入区 / 弹窗）
+   -----------------------------------------------------------------------------
+   情绪基调：这里是「读」的区域，不是「操作」的区域。整屏只允许三种高饱和出现——
+   冰蓝（能点）、金（值得看/待处理）、身份色（谁在说话），其余一律靠灰阶分层。
+   灰阶（自下而上）：#log 即 canvas（最暗）→ 气泡抬到 raised → 思维链/代码块/输入框
+   反而沉到 sunken。「附属信息比正文更暗」是本方案最核心的一条，读者一眼能把正文留在最亮那层。
+   身份色只做 2px 左条 + 名字：气泡明度必须先服从灰阶，颜色只做「这是谁」的索引；
+   3px 会让左条变成色块，还会和 hl 的金边打架。
+   规范：不改任何布局属性，只动颜色/背景/描边色与粗细/阴影/半径/动效。
+   ========================================================================== */
+
+/* ── 一、主区容器与头部 ─────────────────────────────────────────────────── */
+
+/* 原问题：main 靠 body 底色，header 与侧栏同一块灰，没有「区」的感觉 → 主区显式落到 canvas */
+main { background: var(--nc-canvas); }
+
+/* 原问题：header 与侧栏同为 panel，边界只靠一条 #2a2f3a 硬线 → 表面抬到 surface + 发丝线 + 一点点顶缘光 */
+header {
+  background: var(--nc-surface);
+  border-bottom-color: var(--nc-line);
+  box-shadow: var(--nc-inner-hi);
+}
+
+/* 原问题：标题和正文同重同色，视线找不到起点 → 正文色，不加粗以外的变化 */
+header .title { color: var(--nc-text); }
+
+/* 原问题：头部按钮是 #232936 实块，比它所在的 header 还亮，一排按钮像贴纸 → 下沉一格 + 发丝线，hover 才抬起来 */
+header button {
+  background: var(--nc-sunken);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line);
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease);
+}
+header button:hover { color: var(--nc-text); border-color: var(--nc-line-3); background: var(--nc-raised); }
+
+/* 原问题：关闭会话用 #fca5a5 半亮红，和错误气泡的红不同源 → 统一到 danger，hover 才升亮 */
+#shutdown { color: var(--nc-danger); }
+#shutdown:hover { color: var(--nc-danger-hi); border-color: var(--nc-danger-line); background: var(--nc-danger-wash); }
+#shutdown:disabled { color: var(--nc-text-4); border-color: var(--nc-line); background: var(--nc-sunken); }
+
+/* 原问题：「清空本会话上下文」和「关闭」并排同形同重，两者都容易被读成同级危险动作，红就不稀缺了
+   → 清空收回中性（危险色只留给不可逆的「关掉整个会话」，确认弹窗已经承担提示责任） */
+#clear { color: var(--nc-text-2); border-color: var(--nc-line); background: var(--nc-sunken); }
+#clear:hover { color: var(--nc-text); border-color: var(--nc-line-3); background: var(--nc-raised); }
+#clear:active { background: var(--nc-surface); }
+
+/* 原问题：连接状态用 muted，和按钮文字同明度，扫视时读不出这是「状态」 → 三级灰 + 等宽数位 */
+header .conn { color: var(--nc-text-3); font-variant-numeric: tabular-nums; }
+
+/* 原问题：banner 是 #3b1d1d 一整条暗红，太重且与 danger 不同色 → 画布上叠 10% 危险色，只留一条 danger 线 */
+.banner {
+  background: color-mix(in srgb, var(--nc-danger) 10%, var(--nc-canvas));
+  border-bottom-color: var(--nc-danger-line);
+  color: var(--nc-danger-hi);
+}
+
+/* ── 二、消息流骨架 ─────────────────────────────────────────────────────── */
+
+/* 原问题：气泡 background=panel2、描边=line，两者明度差太小，气泡像糊在背景里 → 气泡抬到 raised，配 shadow-1 与顶缘光 */
+.msg {
+  background: var(--nc-raised);
+  border-color: var(--nc-line);
+  border-radius: var(--nc-r-lg);
+  box-shadow: var(--nc-shadow-1), var(--nc-inner-hi);
+  transition: border-color var(--nc-t-fast) var(--nc-ease),
+              box-shadow var(--nc-t-fast) var(--nc-ease);
+}
+
+/* 原问题：.hd 用 muted（≈#98a0b3），名字也是 600 的 muted，元信息和名字抢注意力 → 元信息降到 text-2，名字交给身份色 */
+.msg .hd { color: var(--nc-text-2); }
+
+/* 原问题：.who 只有身份色三种，其余全是继承了 muted 的灰 → 未配色时至少是正文色 */
+.msg .who { color: var(--nc-text); }
+
+/* 原问题：body 继承 body 的 text，本身没问题，但气泡内其它区块把亮度拉平了 → 正文明确写 text，作为整屏最亮的一层 */
+.msg .body { color: var(--nc-text); }
+
+/* 原问题：#fca5a5 的红 hover 让「改写」也像危险操作 → 交互统一冰蓝；默认态降到 text-3，不抢正文 */
+.msg .hd button,
+.sys button {
+  color: var(--nc-text-3);
+  transition: color var(--nc-t-fast) var(--nc-ease), opacity var(--nc-t-fast) var(--nc-ease);
+}
+.msg .hd button:hover,
+.sys button:hover { color: var(--nc-ice); }
+
+/* 原问题：编辑框是 #11141a + #3b82f6 实边，蓝色边太重 → 沉到 sunken，边框用冰蓝 38% 线
+   审计：圆角原为裸写 8px，收敛到 r-md（与 #text 同排同形） */
+.edit {
+  background: var(--nc-sunken);
+  border-color: var(--nc-ice-line);
+  color: var(--nc-text);
+  border-radius: var(--nc-r-md);
+  box-shadow: 0 0 0 2px var(--nc-ice-wash);
+}
+
+/* 原问题：编辑操作条两个按钮都是 #232936 实块，主次不分 → 次按钮下沉、主按钮才是冰蓝实底 */
+.editbar button {
+  background: var(--nc-sunken);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+.editbar button:hover { color: var(--nc-text); border-color: var(--nc-line-3); }
+.editbar button.primary {
+  background: var(--nc-ice);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-ink);
+}
+.editbar button.primary:hover { background: var(--nc-ice-hi); border-color: var(--nc-ice-hi); color: var(--nc-ice-ink); }
+
+/* ── 三、角色变体 ───────────────────────────────────────────────────────── */
+
+/* 原问题：用户气泡是 #152647 一整块饱和蓝，比任何正文都亮，读自己说的话像在读告警
+   → raised 面 + 身份色 14% 透明底 + 32% 透明边；明度只比代理气泡高一点点，靠色相区分 */
+.msg.user {
+  background-color: var(--nc-raised);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--id-user) 14%, transparent),
+    color-mix(in srgb, var(--id-user) 14%, transparent));
+  border-color: color-mix(in srgb, var(--id-user) 32%, transparent);
+  border-bottom-right-radius: var(--nc-r-xs);
+}
+/* 原问题：用户名字 #93c5fd 是另一种蓝，和左条不同源 → 直接引身份色 */
+.msg.user .who { color: var(--id-user); }
+
+/* 原问题：身份色只有一条 3px 竖条，粗得像便签标签 → 收到 2px，颜色本身不动 */
+.msg.claude { border-left: 3px solid var(--id-claude); }
+.msg.claude .who { color: var(--id-claude); }
+.msg.codex { border-left: 3px solid var(--id-codex); }
+.msg.codex .who { color: var(--id-codex); }
+.msg.codebuddy { border-left: 3px solid var(--id-codebuddy); }
+.msg.codebuddy .who { color: var(--id-codebuddy); }
+.msg.dsh { border-left: 3px solid var(--id-dsh); }
+.msg.dsh .who { color: var(--id-dsh); }
+.msg.model { border-left: 3px solid var(--id-model); }
+.msg.model .who { color: var(--id-model); }
+
+/* 原问题：claudelink 是中性灰 + opacity .85，正文跟着一起糊 → 只压正文到 text-2，左条用中性身份色 */
+.msg.claudelink { border-left: 3px solid var(--id-mirror); opacity: .92; }
+.msg.claudelink .who { color: var(--id-mirror); }
+.msg.claudelink .body { color: var(--nc-text-2); }
+
+/* 原问题：#ef4444 的 3px 红条 + 红名字，红得比正文还跳 → 2px danger 条 + 7% 危险底色，让「内容」还是可读的 */
+.msg.error {
+  border-left: 3px solid var(--nc-danger);
+  background-color: color-mix(in srgb, var(--nc-danger) 7%, var(--nc-raised));
+}
+.msg.error .who { color: var(--nc-danger); }
+
+/* 原问题：待确认气泡是 #231d13 的土黄块，和 hl 高亮同色，两种语义撞色 → 金 wash 只做 9%，条 2px，名字用 gold-hi */
+.msg.perm {
+  border-left: 3px solid var(--nc-gold);
+  background-color: color-mix(in srgb, var(--nc-gold) 9%, var(--nc-raised));
+}
+.msg.perm .who { color: var(--nc-gold-hi); }
+
+/* 原问题：流式气泡的虚线边是 #3f4a5e，几乎看不见；而且 border-color 会把左身份条一起刷成灰，
+   代理一开口左色条就消失 → 只改上/右/下三边（提到 line-3），左边留给身份色 */
+.msg.streaming {
+  border-top-color: var(--nc-line-3);
+  border-right-color: var(--nc-line-3);
+  border-bottom-color: var(--nc-line-3);
+}
+.msg.streaming .hd .chip.typing { color: var(--nc-gold); border-color: var(--nc-gold-line); }
+
+/* 原问题：hl 用 #b45309 inset 1px + #231d13 底，是「暗土黄块」，在暗底上根本不像高亮 → 10% 金 wash + 32% 金内描边 */
+/* 艺术指导补：高亮信息 > 说话人身份。左条原本是身份色（蓝/紫/绿），压在金色底上会打架，
+   读者会先看到"谁说的"而不是"这条重要"。标注是人手动加的，优先级最高，所以左条一并转金。 */
+.msg.hl {
+  background-color: color-mix(in srgb, var(--nc-gold) 10%, var(--nc-raised));
+  /* 审计：重写 box-shadow 时丢了 .msg 的顶缘微光（inner-hi），高亮气泡比同级气泡少一层材质 → 补回 */
+  box-shadow: inset 0 0 0 1px var(--nc-gold-line), var(--nc-shadow-1), var(--nc-inner-hi);
+  border-left-color: var(--nc-gold);
+}
+/* 原问题：.hl.user 是 #1b2843，一堆蓝，和用户色不同源 → 保留用户 14% 底，只加金内描边 */
+.msg.hl.user {
+  background-color: var(--nc-raised);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--id-user) 14%, transparent),
+    color-mix(in srgb, var(--id-user) 14%, transparent));
+  border-color: color-mix(in srgb, var(--nc-gold) 32%, transparent);
+  box-shadow: inset 0 0 0 1px var(--nc-gold-line), var(--nc-shadow-1), var(--nc-inner-hi);
+}
+
+/* 原问题：★ 用 #f59e0b，比系统里其它金都亮 → gold */
+.msg .hd .star { color: var(--nc-gold); }
+
+/* 原问题：三个 tstat 只有描边没有底，在气泡里像三根漂着的细线 → 做成 8% 底 + 对应色线的胶囊（尺寸全不动） */
+.msg .hd .tstat.ok {
+  color: var(--nc-ok);
+  border-color: var(--nc-ok-line);
+  background: color-mix(in srgb, var(--nc-ok) 8%, transparent);
+}
+.msg .hd .tstat.err {
+  color: var(--nc-danger);
+  border-color: var(--nc-danger-line);
+  background: color-mix(in srgb, var(--nc-danger) 8%, transparent);
+}
+.msg .hd .tstat.warn {
+  color: var(--nc-gold);
+  border-color: var(--nc-gold-line);
+  background: color-mix(in srgb, var(--nc-gold) 8%, transparent);
+}
+
+/* 原问题：errline 用 #fca5a5，和 tstat.err 又是两种红 → danger-hi，比标签亮一档（它是给人读的正文级信息） */
+.msg .errline { color: var(--nc-danger-hi); }
+
+/* 原问题：选中片段 20% #f59e0b 底 + #b45309 下划线，像marker 笔涂过 → 金 18% 底 + gold-line 下划，与 hl 同源 */
+.hlseg {
+  background: color-mix(in srgb, var(--nc-gold) 18%, transparent);
+  border-bottom-color: var(--nc-gold-line);
+}
+
+/* ── 四、思维链 ─────────────────────────────────────────────────────────── */
+
+/* 原问题：思维链开关 #8fa0bd 和正文灰混在一起，根本看不出是个按钮 → 默认 text-2，hover 冰蓝
+   审计：hover 用的 ice-hi 比全站其它文本型 hover（.msg .hd button / .morebtn / .copybtn）都亮一档
+   → 统一到 ice，ice-hi 只留给「选中/展开」 */
+.thtoggle { color: var(--nc-text-2); transition: color var(--nc-t-fast) var(--nc-ease); }
+.thtoggle:hover { color: var(--nc-ice); }
+
+/* 原问题：thinkbox 用 #141a24 + #3b4a63 左条，与气泡底色差太小，思维链像正文的续段
+   → 沉到 sunken（比气泡暗一档）+ 左侧 2px line-3，读的时候自然把它当「后台」 */
+.thinkbox {
+  background: var(--nc-sunken);
+  border-left: 2px solid var(--nc-line-3);
+  border-radius: 0 var(--nc-r-sm) var(--nc-r-sm) 0;
+}
+
+/* 原问题：thinkbody 是 #93a1b8，在 #141a24 上对比不足，且和正文同为 12.5px 分不开 → 提到 text-2 */
+.thinkbody { color: var(--nc-text-2); }
+
+/* 原问题：thklbl 与 thtoggle 同灰但无 hover，像断了链接的按钮 → 三级灰，明确它是只读注释 */
+.thklbl { color: var(--nc-text-3); }
+
+/* ── 五、执行步骤流 ─────────────────────────────────────────────────────── */
+
+/* 原问题：上虚线 #2c3546 几乎和气泡底同色，步骤流和正文之间没有「分隔」这件事 → 虚线换成 line，保留 dashed 形态 */
+.steps {
+  border-top-color: var(--nc-line);
+}
+
+/* 原问题：步骤正文 #c6d0de 太亮，和消息正文抢层级 → 全体降到 text-2（它永远是附属流） */
+.tstep { color: var(--nc-text-2); }
+
+/* 原问题：ico 用 #8b98ad，✓ 与正文同亮，一行行看下来很吵 → text-3 */
+.tstep .ico { color: var(--nc-text-3); }
+
+/* 原问题：dur 是 #66718a（深底上 ≈3.1:1，读不清），且数字不等宽导致竖排抖动 → text-3 + 等宽数位 */
+.tstep .dur { color: var(--nc-text-3); font-variant-numeric: tabular-nums; }
+
+/* 原问题：running 用 #f5c26b 整行染色，一步在跑就整段发黄 → 正文回 text-2，只让状态词与 ico 保留金 */
+.tstep.running { color: var(--nc-gold); }
+.tstep.running .ico { color: var(--nc-gold); }
+
+/* 原问题：error 用 #ef8b8b（偏粉的红），与 danger 不同族
+   审计：步骤失败原本用 --nc-warn 橙，与「红=真失败」口径冲突，也抢掉了橙色唯一该待的
+   命令行走廊 → 与 .msg.error / .tstat.err / .wb-error 统一到 danger（橙只留给 .cmdline） */
+.tstep.error { color: var(--nc-danger); }
+.tstep.error .ico { color: var(--nc-danger); }
+
+/* 原问题：skipped 用 #66718a，删线+深灰等于在正文里挖了个洞 → text-3，删线保留 */
+.tstep.skipped { color: var(--nc-text-3); }
+
+/* 原问题：可展开步骤的 › 与 ▾ 都是 #66718a，展开与否看不出差别 → 收起 text-3、展开冰蓝 */
+.tstep.hasdetail .lb::after { color: var(--nc-text-3); }
+.tstep.open .lb::after { color: var(--nc-ice); }
+/* 审计：可展开行整行是 cursor:pointer 却没有任何 hover 反馈（点了没反应）→ 未展开时把 › 提一档；
+   已展开的不动，避免和「展开=冰蓝」的语汇打架 */
+.tstep.hasdetail:not(.open):hover .lb::after { color: var(--nc-text-2); }
+
+/* 原问题：detail 用 #11141a + #2a2f3a，比气泡暗但边太硬，像嵌了个终端 → sunken + line，圆角收到 r-sm */
+.tstep .detail {
+  background: var(--nc-sunken);
+  border-color: var(--nc-line);
+  border-radius: var(--nc-r-sm);
+}
+
+/* 原问题：filelink 是 #93c5fd + #3b82f6 下划，和用户气泡同一种蓝
+   审计：默认就用了满亮的 ice-hi，hover 反而退回 ice（越悬停越暗）→ 反过来：默认 ice，hover ice-hi */
+.tstep .detail .filelink { color: var(--nc-ice); border-bottom-color: var(--nc-ice-line); }
+.tstep .detail .filelink:hover { color: var(--nc-ice-hi); }
+
+/* 原问题：diffstat #7c879b 太亮，+2 −1 这种数字应退到背景 → text-3 + 等宽数位 */
+.tstep .detail .diffstat { color: var(--nc-text-3); font-variant-numeric: tabular-nums; }
+
+/* 原问题：diff 增删是「两种不同饱和的红绿」（#86efac/#fca5a5 各配 14% 纯色底） → 统一到 ok/danger，13% 底 */
+.tstep .detail .diffadd {
+  background: color-mix(in srgb, var(--nc-ok) 13%, transparent);
+  color: var(--nc-ok);
+}
+.tstep .detail .diffdel {
+  background: color-mix(in srgb, var(--nc-danger) 13%, transparent);
+  color: var(--nc-danger);
+}
+
+/* 原问题：diffctx #66718a 与 diff 行同尺寸，上下文行反而更抢 → text-3 */
+.tstep .detail .diffctx { color: var(--nc-text-3); }
+
+/* 原问题：cmdlbl #7c879b 是「标签」却比命令本身亮 → text-3 */
+.tstep .detail .cmdlbl { color: var(--nc-text-3); }
+
+/* 原问题：cmdline 用金色，与 running 的金撞，命令看起来像在跑 → 告警橙（命令是「将要/已经执行」的强提示） */
+.tstep .detail .cmdline { color: var(--nc-warn); }
+
+/* 原问题：cmdout/rawjson 都是 #98a0b3，输出与原始 JSON 同权重 → 输出 text-2、rawjson text-3 */
+.tstep .detail .cmdout { color: var(--nc-text-2); }
+.tstep .detail .rawjson { color: var(--nc-text-3); }
+
+/* 原问题：+#3fb950 / −#f85149 是 GitHub 的另一套红绿，与 diffadd/diffdel 不同源 → ok/danger */
+.tstep .detail .plus { color: var(--nc-ok); }
+.tstep .detail .minus { color: var(--nc-danger); }
+
+/* 原问题：copybtn 是 #7c879b 边 + #2a2f3a 框，hover 又是 #3b82f6 → text-3 + line-2，hover 冰蓝 */
+.tstep .detail .copybtn {
+  color: var(--nc-text-3);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+.tstep .detail .copybtn:hover { color: var(--nc-ice); border-color: var(--nc-ice-line); }
+
+/* 原问题：filehead #7c879b 在 sunken 上偏亮，文件名行喧宾夺主 → text-3 */
+.tstep .detail .filehead { color: var(--nc-text-3); }
+
+/* ── 六、系统行与浮动条 ─────────────────────────────────────────────────── */
+
+/* 原问题：系统提示用 muted，和消息元信息同亮，居中一行灰字像正文碎片 → text-3，明确它是旁白 */
+.sys { color: var(--nc-text-3); }
+
+/* 原问题：morebtn 是 #1b2230 底 + #2a3a55 蓝边，一块独立的蓝灰补丁 → raised 底 + line-2，hover 才给冰蓝 */
+.morebtn {
+  background: var(--nc-raised);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+.morebtn:hover { color: var(--nc-ice); border-color: var(--nc-ice-line); }
+
+/* 原问题：浮条用 #1b202b，比它浮在上的气泡还暗，层次是反的 → overlay + shadow-2 */
+#selBar {
+  background: var(--nc-overlay);
+  border-color: var(--nc-line-2);
+  box-shadow: var(--nc-shadow-2);
+}
+#selBar button { color: var(--nc-text); transition: background-color var(--nc-t-fast) var(--nc-ease); }
+#selBar button:hover { background: var(--nc-overlay-2); }
+
+/* 原问题：hl 浮条是 #7c5a12 金边浮层，金边过饱和 → overlay 底 + gold-line 边，字用 gold
+   审计：金挂在按钮文字上会让「金=待处理」同时表示「能点」；金只留在框边（框的是高亮对象本身），
+   按钮文字回到正文色，hover 才按「能点=冰蓝」亮起 */
+#hlBar {
+  background: var(--nc-overlay);
+  border-color: var(--nc-gold-line);
+  box-shadow: var(--nc-shadow-2);
+}
+#hlBar button { color: var(--nc-text); transition: background-color var(--nc-t-fast) var(--nc-ease), color var(--nc-t-fast) var(--nc-ease); }
+#hlBar button:hover { background: var(--nc-overlay-2); color: var(--nc-ice-hi); }
+
+/* ── 七、输入区 ─────────────────────────────────────────────────────────── */
+
+/* 原问题：composer 与 header 同为 panel，中间没有任何分界，输入区像浮在消息流上
+   → surface + 用 inset 阴影画顶缘发丝线（不走 border，避免 1px 布局位移） */
+footer#composer {
+  background: var(--nc-surface);
+  box-shadow: inset 0 1px 0 var(--nc-line);
+}
+
+/* 原问题：#targets 未选中的胶囊是 #232936 实块，五个胶囊就是一条亮色带 → 透明底 + line-2，只描边 */
+#targets button {
+  background: transparent;
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease);
+}
+/* 审计：未选中胶囊 hover 只换字色+边色，鼠标扫过去几乎没反馈 → 补一层中性白膜；
+   不用冰蓝 wash，否则 hover 与选中（冰蓝 wash）分不开 */
+#targets button:hover { color: var(--nc-text); border-color: var(--nc-line-3); background: var(--nc-line); }
+/* 原问题：选中态是 #1d4ed8 实底白字，整行里最刺眼的一块 → 冰蓝 12% wash + ice-line，选中靠「被点亮」而不是「被涂满」 */
+#targets button.on {
+  background: var(--nc-ice-wash);
+  color: var(--nc-ice-hi);
+  border-color: var(--nc-ice-line);
+}
+
+/* 原问题：.chip 用 muted + line，在气泡头部和 tstat 混成一片 → 三级灰 + line-2，永远比 tstat 弱 */
+.chip { color: var(--nc-text-3); border-color: var(--nc-line-2); }
+#targets .chip { color: var(--nc-text-3); }
+
+/* 原问题：输入框是 #11141a + #2a2f3a，和上方消息流同色，输入区没有「凹槽」感 → sunken + 发丝线，聚焦才亮
+   审计：边线用的是 line（6.5%），而侧栏与弹窗的输入框都是 line-2（10%），同一层控件两种边
+   → 统一 line-2；圆角原来裸写 10px，收敛到 r-md */
+#text {
+  background: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  transition: border-color var(--nc-t-fast) var(--nc-ease), box-shadow var(--nc-t-base) var(--nc-ease);
+}
+/* 原问题：聚焦只靠浏览器默认 outline，和整体色板无关 → 冰蓝边 + 2px ice-wash 外环 */
+#text:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+  box-shadow: 0 0 0 2px var(--nc-ice-wash);
+}
+
+/* 原问题：占位文字走浏览器默认 #757575，比输入框里任何真实文字都暗但比它该有的层级更乱 → 统一到三级灰 */
+#text::placeholder { color: var(--nc-text-3); }
+.grid input::placeholder,
+.mp-row input::placeholder,
+#mpModelRow input::placeholder { color: var(--nc-text-3); }
+
+/* 原问题：#pick「＋文件」没有样式规则，走的是浏览器默认按钮（近白底黑字），整屏最亮的一块
+   → 和 #send 并列的次级动作：sunken 底 + 发丝线，hover 才给冰蓝
+   审计：hover 字色用 ice-hi，与全站文本型 hover 的 ice 不统一 → 收到 ice */
+#pick {
+  background: var(--nc-sunken);
+  color: var(--nc-text-2);
+  border: 1px solid var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  cursor: pointer;
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease);
+}
+#pick:hover { color: var(--nc-ice); border-color: var(--nc-ice-line); background: var(--nc-raised); }
+
+/* 原问题：#1d4ed8 底 + 白字，在亮蓝上白字对比只有 3.7:1，且蓝比任何正文都饱和 → 冰蓝实底 + 冰蓝深字
+   审计：圆角裸写 10px，与相邻的 #text/#pick（r-md）不齐 → 收敛到 r-md */
+#send {
+  background: var(--nc-ice);
+  color: var(--nc-ice-ink);
+  border-radius: var(--nc-r-md);
+  transition: background-color var(--nc-t-fast) var(--nc-ease), opacity var(--nc-t-fast) var(--nc-ease);
+}
+#send:hover { background: var(--nc-ice-hi); }
+#send:active { background: var(--nc-ice-lo); }
+#send:disabled { opacity: .42; color: var(--nc-ice-ink); }
+
+/* 原问题：#stop 常态 #1b2230 + #6b7688 图标，在暗底上几乎是个空圆；live 时又变回 #2563eb 的旧蓝 → 沉底 + 冰蓝 live */
+#stop {
+  background: var(--nc-sunken);
+  border-color: var(--nc-line-2);
+  transition: background-color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease);
+}
+#stop svg { fill: var(--nc-text-3); }
+#stop:hover { border-color: var(--nc-line-3); }
+#stop.live { background: var(--nc-ice); border-color: var(--nc-ice); }
+#stop.live svg { fill: var(--nc-ice-ink); }
+#stop.live:hover { background: var(--nc-ice-hi); border-color: var(--nc-ice-hi); }
+#stop[disabled] { opacity: .4; }
+
+/* 原问题：.hint 用 muted，和正文灰同级 → text-3 */
+.hint { color: var(--nc-text-3); }
+
+/* 原问题：hintbar 是 11px 的 muted 长句，一整面灰字墙，和正文抢同一层明度
+   → 整条降到 text-3，只有 caret/label 用 text-2 做「这是个可展开的入口」的提示；不加粗、不加背景 */
+.hintbar { color: var(--nc-text-3); }
+.hintbar .caret { color: var(--nc-text-2); }
+.hintbar .hintlabel { color: var(--nc-text-2); }
+/* 原问题：hover 时整条变 #c9d1e4（比正文还亮），一碰就炸 → 只升到 text-2 */
+.hintbar:hover .caret,
+.hintbar:hover .hintlabel,
+.hintbar:hover .hint { color: var(--nc-text-2); }
+
+/* ── 八、弹窗 ───────────────────────────────────────────────────────────── */
+
+/* 原问题：遮罩 rgba(0,0,0,.55) 偏灰，糊住但没压下去 → 更深的冷黑 + 保留 6px 模糊 */
+.mask { background: var(--nc-scrim); backdrop-filter: blur(6px); }
+
+/* 原问题：对话框 background=panel（和侧栏同色），在遮罩上几乎看不出是浮层 → overlay + line-2 + shadow-3 */
+.dialog {
+  background: var(--nc-overlay);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-xl);
+  box-shadow: var(--nc-shadow-3);
+}
+.dialog h2 { color: var(--nc-text); }
+
+/* 原问题：表单 label 用 muted，和输入值同亮，读不出哪个是标签 → text-2 */
+.grid label { color: var(--nc-text-2); }
+
+/* 原问题：弹窗输入框是 #11141a + line，和遮罩底几乎同色，看不出可输入 → sunken + line，聚焦冰蓝
+   审计：边线 line（6.5%）比侧栏/工作台同类输入框的 line-2（10%）弱一档，同一层控件两种边
+   → 统一 line-2；圆角裸写 8px，收敛到 r-sm */
+.grid input,
+.grid select,
+.grid textarea {
+  background: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  transition: border-color var(--nc-t-fast) var(--nc-ease), box-shadow var(--nc-t-base) var(--nc-ease);
+}
+.grid input:focus,
+.grid select:focus,
+.grid textarea:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+  box-shadow: 0 0 0 2px var(--nc-ice-wash);
+}
+
+/* 原问题：ops 里两个按钮同为 #232936，主按钮只多一层 #1d4ed8 → 次按钮 overlay-2，主按钮才是冰蓝实底 */
+.dialog button {
+  background: var(--nc-overlay-2);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  transition: border-color var(--nc-t-fast) var(--nc-ease), background-color var(--nc-t-fast) var(--nc-ease);
+}
+.dialog button:hover { border-color: var(--nc-line-3); }
+.dialog button.primary {
+  background: var(--nc-ice);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-ink);
+}
+.dialog button.primary:hover { background: var(--nc-ice-hi); border-color: var(--nc-ice-hi); }
+
+/* 原问题：note 用 muted，与 label 同亮，注释和字段标签分不开 → text-2（12px，仍承载信息） */
+.note { color: var(--nc-text-2); }
+
+/* ── 九、成员 / 权限弹窗 ────────────────────────────────────────────────── */
+
+/* 原问题：分区线用 line，与对话框边同亮，分区像多画了一个框 → 只留发丝线 */
+.mp-sec { border-top-color: var(--nc-line); }
+.mp-sec h3 { color: var(--nc-text-2); }
+
+/* 原问题：授权项的备注 .m 用 #f5c26b，和 hl 的金同亮但语义不同 → gold（「需要你知道」） */
+.grant .m { color: var(--nc-gold); }
+
+/* 原问题：grant/mp-row 的按钮是 #232936 实块，在 overlay 上反而更暗，像禁用 → 透明底 + line-2 */
+.grant button,
+.mp-row button {
+  background: transparent;
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+.grant button:hover,
+.mp-row button:hover { color: var(--nc-text); border-color: var(--nc-line-3); }
+
+/* 原问题：#mpModelRow / .mp-row 的输入控件是 #1b2230 / #11141a 两套色 → 统一 sunken + line
+   审计：同上，边线收到 line-2，与 .grid / #text / 工作台一致 */
+#mpModelRow select,
+#mpModelRow input,
+.mp-row input,
+.mp-row select {
+  background: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+}
+#mpModelRow select:focus,
+#mpModelRow input:focus,
+.mp-row input:focus,
+.mp-row select:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+  box-shadow: 0 0 0 2px var(--nc-ice-wash);
+}
+
+/* 原问题：权限块是 #231d13 土黄 + #7c5a12 硬边，和 hl 高亮撞成同一个色 → 8% 金 wash + gold-line
+   层叠修正：.perm 同时是「消息气泡」和「气泡里那张权限卡」的类名（.msg.perm > .perm），
+   气泡因此被这条规则的 border-radius / border-color 染上（实测圆角从 r-lg 掉到 r-md、四边变金线）
+   → 用 :not(.msg) 把气泡本身排除，只留卡片 */
+.perm:not(.msg) {
+  background: color-mix(in srgb, var(--nc-gold) 8%, transparent);
+  border-color: var(--nc-gold-line);
+  border-radius: var(--nc-r-md);
+}
+.perm .t { color: var(--nc-gold); }
+.perm .p { color: var(--nc-text); }
+.perm .r { color: var(--nc-text-2); }
+
+/* 审计：权限卡嵌在 .msg.perm 气泡里时，两层金 wash（9% 打底 + 8% 再叠）只差 1%，卡片和气泡糊成一块
+   → 气泡内的卡不再叠金，改按「气泡内嵌块一律下沉」的规则落到 sunken，靠金发丝线表示语义 */
+.msg .perm { background: var(--nc-sunken); }
+
+/* 原问题：ok/no 是 #14532d / #4c1d1d 两块饱和暗底，按钮像色块 → ok/danger 的 12% wash + 对应线，仅「是/否」两色 */
+.perm button {
+  background: var(--nc-raised);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  transition: color var(--nc-t-fast) var(--nc-ease),
+              background-color var(--nc-t-fast) var(--nc-ease),
+              border-color var(--nc-t-fast) var(--nc-ease);
+}
+.perm button:hover { color: var(--nc-text); border-color: var(--nc-line-3); }
+.perm button.ok { background: var(--nc-ok-wash); border-color: var(--nc-ok-line); color: var(--nc-ok); }
+.perm button.ok:hover { background: color-mix(in srgb, var(--nc-ok) 18%, transparent); }
+.perm button.no { background: var(--nc-danger-wash); border-color: var(--nc-danger-line); color: var(--nc-danger-hi); }
+.perm button.no:hover { background: color-mix(in srgb, var(--nc-danger) 18%, transparent); }
+
+/* ── 十、附件与拖拽 ─────────────────────────────────────────────────────── */
+
+/* 原问题：att-chip 是 #1b2740 + #2b3c5e 一套独立的深蓝，系统里第三套蓝
+   审计：附件标签是纯文本（不可点），用冰蓝 wash + ice-hi 字会让它读成按钮/链接，和「冰蓝=能点」撞车
+   → 回到和 .att-item 同一套中性材质（raised + line-2 + 正文色），靠 📎 图标区分它是附件 */
+.att-chip {
+  background: var(--nc-raised);
+  border-color: var(--nc-line-2);
+  color: var(--nc-text);
+}
+
+/* 原问题：att-item 同样的 #1b2740，比输入框亮，附件比输入内容还显眼 → sunken + line-2，和输入框同一层 */
+.att-item {
+  background: var(--nc-sunken);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  color: var(--nc-text-2);
+}
+/* 审计：「移除附件」默认就刷满红，红在静态态被摊薄到看不出轻重 → 默认中性（text-3），
+   只有 hover 才亮起 danger，与 .wb-participant button:hover（移除角色）同一套 */
+.att-item button { color: var(--nc-text-3); transition: color var(--nc-t-fast) var(--nc-ease); }
+.att-item button:hover { color: var(--nc-danger-hi); }
+
+/* 原问题：attStatus 用 muted，与附件名同亮 → text-3 */
+#attStatus { color: var(--nc-text-3); }

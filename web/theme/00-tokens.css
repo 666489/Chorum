@@ -1,0 +1,148 @@
+/* =============================================================================
+   00-tokens.css — 「夜间控制台 / Night Console」色彩系统 · 单一事实来源
+   -----------------------------------------------------------------------------
+   规则：
+   1) 本文件只放 token 与全局基座（选择、焦点、滚动条、环境光），不放组件样式。
+   2) 后续 10/20/30 三个区域文件只允许引用这里的 token，不得再出现裸 hex。
+   3) 层级（elevation）只走 5 级表面 + 2 级描边，禁止各自发明灰。
+   4) 可交互色（ice）负责「能点」，注意色（gold）负责「值得看」，
+      两者严格分工：交互永远是冰蓝，重要/星标/待处理永远是金。
+   ========================================================================== */
+
+:root {
+  /* ── 表面阶梯：从画布到浮层，每级 +4~7 L ---------------------------------- */
+  --nc-canvas:      #0b0e13;  /* 最底：聊天流背景 */
+  --nc-sunken:      #0e131a;  /* 下沉：输入框、代码块、思维链 */
+  --nc-surface:     #131821;  /* 常规面板：侧栏、头部、编辑器 */
+  --nc-raised:      #19202b;  /* 抬起：卡片、消息气泡、悬浮菜单 */
+  --nc-overlay:     #202835;  /* 浮层：对话框、浮条 */
+  --nc-overlay-2:   #26303f;  /* 浮层内再次抬起：输入框聚焦、选中项 */
+
+  /* ── 描边：靠透明度叠在表面上，避免为每个表面配一条灰 ───────────────── */
+  --nc-line:        rgba(255,255,255,.065);  /* 常规发丝线 */
+  --nc-line-2:      rgba(255,255,255,.10);   /* 分区、卡片边 */
+  --nc-line-3:      rgba(255,255,255,.155);  /* 强边：聚焦前的 hover */
+
+  /* ── 文本四级 ───────────────────────────────────────────────────────── */
+  --nc-text:        #e8edf5;  /* 正文       ≈15.6:1 on canvas */
+  --nc-text-2:      #a7b3c6;  /* 次要       ≈7.4:1  */
+  --nc-text-3:      #8f9db3;  /* 三级标签   最低 4.85:1（overlay-2 上） */
+  --nc-text-4:      #5e6a7c;  /* 仅限禁用/装饰，不承载信息 */
+
+  /* ── 交互色（ice）：按钮、链接、焦点、选中 ─────────────────────────── */
+  --nc-ice:         #7cc4e8;
+  --nc-ice-hi:      #9bd6f2;
+  --nc-ice-lo:      #5fafd4;
+  --nc-ice-ink:     #06181f;          /* 冰蓝底上的字 */
+  --nc-ice-wash:    rgba(124,196,232,.12);
+  --nc-ice-line:    rgba(124,196,232,.38);
+
+  /* ── 注意色（gold）：星标、置顶、高亮、需人工确认 ──────────────────── */
+  --nc-gold:        #e9c46a;
+  --nc-gold-hi:     #f4d78c;
+  --nc-gold-lo:     #c9a44f;
+  --nc-gold-ink:    #1d1508;
+  --nc-gold-wash:   rgba(233,196,106,.10);
+  --nc-gold-line:   rgba(233,196,106,.32);
+
+  /* ── 状态色 ─────────────────────────────────────────────────────────── */
+  --nc-ok:          #5bd6a0;
+  --nc-ok-wash:     rgba(91,214,160,.12);
+  --nc-ok-line:     rgba(91,214,160,.34);
+  --nc-warn:        #f0a85c;
+  --nc-danger:      #f07c7c;
+  --nc-danger-hi:   #ff9d9d;
+  --nc-danger-wash: rgba(240,124,124,.12);
+  --nc-danger-line: rgba(240,124,124,.34);
+
+  /* ── 智能体身份色：同明度、控饱和，靠色相区分（色轮 18/160/186/222/245/285） ─ */
+  --id-user:        #7f9df5;  /* 我 245° */
+  --id-claude:      #e08a6b;  /* 18°  */
+  --id-codex:       #3fc79a;  /* 160° */
+  --id-model:       #58c6e8;  /* 186° */
+  --id-dsh:         #6e9bff;  /* 222° */
+  --id-codebuddy:   #9a8dff;  /* 285° */
+  --id-mirror:      #8a94a6;  /* 中性 */
+
+  /* ── 兼容旧变量名：原样式表大量使用这 12 个变量，改这里即全局换肤 ───── */
+  --bg:       var(--nc-canvas);
+  --panel:    var(--nc-surface);
+  --panel2:   var(--nc-raised);
+  --line:     rgba(255,255,255,.085);
+  --bar:      #10151d;
+  --text:     var(--nc-text);
+  --muted:    var(--nc-text-2);
+  --user:     var(--id-user);
+  --claude:   var(--id-claude);
+  --codex:    var(--id-codex);
+  --codebuddy:var(--id-codebuddy);
+  --dsh:      var(--id-dsh);
+  --mirror:   var(--id-mirror);
+
+  /* ── 遮罩（scrim）：全站只有两种压暗 —— 弹窗类用一个色，全屏拖拽层用更重的一个 ── */
+  --nc-scrim:       rgba(6, 9, 14, .62);
+  --nc-scrim-2:     rgba(0, 0, 0, .66);
+
+  /* ── 形状与阴影 ─────────────────────────────────────────────────────── */
+  --nc-r-xs: 4px;
+  --nc-r-sm: 6px;
+  --nc-r-md: 9px;
+  --nc-r-lg: 12px;
+  --nc-r-xl: 16px;
+  --nc-shadow-1: 0 1px 2px rgba(0,0,0,.35);
+  --nc-shadow-2: 0 6px 18px rgba(0,0,0,.45);
+  --nc-shadow-3: 0 22px 60px rgba(0,0,0,.58);
+  --nc-inner-hi: inset 0 1px 0 rgba(255,255,255,.045);  /* 抬起层的顶缘微光 */
+
+  /* ── 动效 ───────────────────────────────────────────────────────────── */
+  --nc-ease: cubic-bezier(.22,.61,.36,1);
+  --nc-t-fast: .12s;
+  --nc-t-base: .18s;
+
+  /* ── 字体 ───────────────────────────────────────────────────────────── */
+  --nc-font: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --nc-mono: ui-monospace, "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+}
+
+/* ── 全局基座 ─────────────────────────────────────────────────────────── */
+
+html, body { background: var(--nc-canvas); }
+
+body {
+  color: var(--nc-text);
+  font-family: var(--nc-font);
+  /* 环境光：左上极弱冷光 + 右下极弱暖光，给纯黑底一点空间感（≤3% 不透明度） */
+  background-image:
+    radial-gradient(1200px 620px at 12% -10%, rgba(124,196,232,.045), transparent 62%),
+    radial-gradient(900px 520px at 92% 108%, rgba(233,196,106,.030), transparent 60%);
+  background-attachment: fixed;
+}
+
+::selection { background: rgba(124,196,232,.30); color: #fff; }
+
+/* 焦点环：只在键盘导航时出现，颜色跟随交互色 */
+:focus-visible {
+  outline: 2px solid var(--nc-ice-line);
+  outline-offset: 2px;
+  border-radius: var(--nc-r-sm);
+}
+
+/* 滚动条：细、半透明、hover 才显形，避免抢视线 */
+* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.14) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,.10);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.20); background-clip: content-box; }
+*::-webkit-scrollbar-corner { background: transparent; }
+
+/* 数字对齐：状态栏、耗时、diffstat 里的数字用等宽数位 */
+#status, .dur, .diffstat, .kv b { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}

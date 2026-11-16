@@ -1,0 +1,322 @@
+/* =============================================================================
+   10-shell.css — 外壳层配色：活动栏 / 侧栏 / 成员卡 / 会话列表 / 状态栏 / 拖拽遮罩
+   -----------------------------------------------------------------------------
+   这一层承担「导航与操控」，不承担内容阅读，所以整体压暗、把亮度让给聊天流。
+   灰阶分配：
+     活动栏  = --nc-canvas   （最左，比侧栏深一档，退到背景里）
+     侧栏    = --nc-surface  （常规面板面）
+     卡片/box = --nc-raised  （抬起，配 --nc-inner-hi 顶缘微光）
+     菜单/浮条 = --nc-overlay（唯一允许「比卡片更亮」的地方）
+     状态栏  = --nc-canvas   （与活动栏同深，收住窗口底边）
+   交互色只用冰蓝（能点 / 选中 / 焦点），金色只留给置顶与冷启动提示，两者不混用。
+   本文件只改颜色与装饰线，没有任何布局属性。
+   ========================================================================== */
+
+/* ============================ 1. 活动栏 ============================== */
+
+/* 原问题：活动栏用 --bar(#12151b) 与侧栏几乎同明度，两层糊成一块 → 降到 canvas */
+#activity { background: var(--nc-canvas); border-right-color: var(--nc-line); }
+
+/* 原问题：图标默认 --muted 偏亮，整列一直在说话 → 默认 text-3，hover 才提亮 */
+#activity .act {
+  color: var(--nc-text-3);
+  border-radius: var(--nc-r-sm);
+  transition: color var(--nc-t-fast) var(--nc-ease), background-color var(--nc-t-fast) var(--nc-ease);
+}
+/* 原问题：hover 只换字色，反馈弱 → 加一层极轻白膜，仍不加边框 */
+#activity .act:hover { color: var(--nc-text); background: var(--nc-line); }
+
+/* 原问题：选中态是纯白图标 + 纯白竖条，白得刺眼、和冰蓝体系打架 → 冰蓝条 + 极轻冰蓝底 */
+#activity .act.on { color: var(--nc-text); background: var(--nc-ice-wash); }
+#activity .act.on::before {
+  background: var(--nc-ice);
+  box-shadow: 0 0 10px var(--nc-ice-line); /* 指示条自身的一点余光，替代原来的纯白硬边 */
+}
+
+/* ============================ 2. 侧边栏 ============================== */
+
+/* 原问题：侧栏与活动栏同明度、右边线与背景同色，边界靠肉眼猜 → surface + 发丝线。
+   附带：侧栏里的复选框/数字框是原生控件，深底上会被渲染成「白底方块」，是整套界面里最刺眼
+   的一处白，所以在这一层声明按深色渲染，只影响侧栏内部的控件 */
+#sidebar { background: var(--nc-surface); border-right-color: var(--nc-line); color-scheme: dark; }
+
+/* 原问题：面板标题 12px 用 --muted，和正文抢注意力 → 降为次要色，只留字重做层级 */
+.panel h2 { color: var(--nc-text-2); }
+
+/* 原问题：box 用 --panel2 但边线是裸灰 #2a2f3a，抬起感全靠加粗 → raised + 发丝线 + 顶缘微光 */
+.box {
+  background: var(--nc-raised);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  box-shadow: var(--nc-inner-hi);
+}
+.box h3 { color: var(--nc-text-2); }
+
+/* ========================= 3. 会话列表 =============================== */
+
+/* 原问题：#232936 配 #2a2f3a 是一条灰砖按钮，和面板底几乎同色 → 次级按钮族：raised + 发丝线 */
+#sidebar #cvNew {
+  background: var(--nc-raised);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  transition: border-color var(--nc-t-fast) var(--nc-ease), background-color var(--nc-t-fast) var(--nc-ease);
+}
+/* 原问题：hover 用 #3b82f6 纯蓝边框，比主按钮还抢 → 冰蓝细边 + 冰蓝极轻底 */
+#sidebar #cvNew:hover {
+  border-color: var(--nc-ice-line);
+  color: var(--nc-text);
+  background: linear-gradient(var(--nc-ice-wash), var(--nc-ice-wash)), var(--nc-raised);
+}
+
+/* 原问题：分组日期 #6b7686 在 surface 上只有 ~3:1，几乎不可读（且 11px） → text-2 */
+.cv-group { color: var(--nc-text-2); }
+
+/* 原问题：hover 的 #1e2430 与列表底色差值太小 → 直接抬到 raised，一眼看出可点 */
+/* 原问题：未选中的会话标题也是纯白，一屏 6 条全在喊 → 静默时用次要色，hover/选中才提亮 */
+.cv-item { color: var(--nc-text-2); transition: background-color var(--nc-t-fast) var(--nc-ease), color var(--nc-t-fast) var(--nc-ease); }
+.cv-item:hover { background: var(--nc-raised); color: var(--nc-text); }
+
+/* 原问题：选中态 #2a3142 是一块更亮的灰，和 hover 只差一点点 → 冰蓝膜 + 1px 冰蓝内描边 */
+.cv-item.on,
+.cv-item.on:hover {
+  background: linear-gradient(var(--nc-ice-wash), var(--nc-ice-wash)), var(--nc-raised);
+  color: var(--nc-text);
+  box-shadow: inset 0 0 0 1px var(--nc-ice-line);
+}
+
+/* 原问题：置顶星是随手取的琥珀 #f5c26b → 收进 gold，与冷启动提示同一族 */
+.cv-item .pin { color: var(--nc-gold); }
+
+/* 原问题：⋯ 用 --muted，hover 变纯白 → 静默用 text-3，hover 提到正文色 */
+.cv-item .more { color: var(--nc-text-3); }
+.cv-item .more:hover { color: var(--nc-text); }
+
+/* 原问题：右键菜单 #1b202b 比卡片还暗、阴影用的是自带 rgba → overlay 层 + 标准浮层阴影 */
+.cv-menu {
+  background: var(--nc-overlay);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-md);
+  box-shadow: var(--nc-shadow-2);
+}
+/* 原问题：菜单项 hover 与菜单底色差值极小 → 用 overlay-2（浮层内再抬起）做焦点 */
+.cv-menu button { color: var(--nc-text); transition: background-color var(--nc-t-fast) var(--nc-ease); }
+.cv-menu button:hover { background: var(--nc-overlay-2); }
+
+/* 原问题：危险项 #fca5a5 与状态栏红、消息错误红各是一套 → 统一 danger，hover 给红膜 */
+.cv-menu button.danger { color: var(--nc-danger); }
+.cv-menu button.danger:hover { background: var(--nc-danger-wash); color: var(--nc-danger-hi); }
+
+/* ========================== 4. 成员卡 ================================ */
+
+/* 原问题：选中卡用 #3b82f6 描边 + inset 蓝外发光，像廉价的高亮框 → 1px 冰蓝线 + 极轻冰蓝底 */
+.agent.active {
+  border-color: var(--nc-ice-line);
+  background: linear-gradient(var(--nc-ice-wash), var(--nc-ice-wash)), var(--nc-raised);
+  box-shadow: var(--nc-inner-hi);
+}
+
+/* 原问题：空闲点 #4b5563 是裸灰，在 raised 上偏脏 → 用 text-4 做中性点 */
+.dot { background: var(--nc-text-4); }
+/* 原问题：运行中用橙 #f59e0b，和红/绿/金挤在一起 → 收进 gold，并加一圈金雾表示「在动」 */
+.dot.run { background: var(--nc-gold); box-shadow: 0 0 0 3px var(--nc-gold-wash); }
+/* 原问题：就绪绿 #22c55e 是 Material 绿，过饱和 → ok 色 + 绿雾，与状态栏同源 */
+.dot.on { background: var(--nc-ok); box-shadow: 0 0 0 3px var(--nc-ok-wash); }
+
+/* 原问题：kind 徽章 10px 用 --muted + 裸灰边，小字糊成一片 → text-2 + 发丝线（10px 不用三级灰） */
+.agent .kind { color: var(--nc-text-2); border-color: var(--nc-line); }
+
+/* 原问题：meta 11px 用 --muted，数字随手排，跳变时会左右抖 → 保持次要色（11px 不用三级灰）+ 等宽数位 */
+.agent .meta { color: var(--nc-text-2); font-variant-numeric: tabular-nums; }
+
+/* 原问题：冷启动提示 #f5c26b 与硬冷启动 #fca5a5 都是散装色 → gold 表示「慢」，danger 表示「硬失败」 */
+.agent .meta .cold { color: var(--nc-gold); }
+.agent .meta .cold.hard { color: var(--nc-danger); }
+
+/* 原问题：#231d13 底 + #7c5a12 边是一块土黄砖，和整个界面不同体系 → gold 洗底 + gold 发丝线 */
+#coldBanner {
+  background: var(--nc-gold-wash);
+  border-color: var(--nc-gold-line);
+  color: var(--nc-gold);
+  border-radius: var(--nc-r-md);
+}
+
+/* ====================== 5. 侧栏按钮家族 ============================== */
+
+/* 原问题：侧栏所有次级按钮共用 #232936 底 + 裸灰边 + --muted 字，看着像一片灰砖 → raised + 发丝线 + 次要字 */
+.agent button,
+.agent label.chk,
+.box button,
+.tt button,
+label.chk {
+  background: var(--nc-raised);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+/* 原问题：hover 直接把字刷成纯白，边线不动 → 提亮字 + 边线升到 line-3（不再纯白） */
+.agent button:hover,
+.box button:hover,
+.tt button:hover,
+label.chk:hover { color: var(--nc-text); border-color: var(--nc-line-3); }
+
+/* 原问题：危险按钮 hover 用 #7f1d1d 暗红边 + #fca5a5，红得不统一 → danger 系 */
+.agent button.danger { color: var(--nc-text-2); }
+.agent button.danger:hover { color: var(--nc-danger); border-color: var(--nc-danger-line); background: var(--nc-danger-wash); }
+
+/* 原问题：主按钮 #1d4ed8 纯业务蓝实底 + 白字，在侧栏里是唯一一块实心亮色，和「发送」抢主操作。
+   现在：全站「实心冰蓝 = 唯一主操作（发送键）」这条规则要成立，配置类动作必须是幽灵态—— */
+#addModel {
+  /* 透明底 + 冰蓝描边 + 冰蓝字，hover 才浮出 wash；这样也不会和成员卡的选中态（冰蓝边 + wash）抢。 */
+  background: transparent;
+  color: var(--nc-ice);
+  border: 1px solid var(--nc-ice-line);
+  border-radius: var(--nc-r-md);
+  box-shadow: none;
+  transition: background-color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease), color var(--nc-t-fast) var(--nc-ease);
+}
+#addModel:hover {
+  background: var(--nc-ice-wash);
+  border-color: var(--nc-ice);
+  color: var(--nc-ice-hi);
+}
+
+/* 原问题：kv 的键值都是 12px，键用 --muted 值用 --text，靠色差勉强分 → 键次要、值正文、数字对齐 */
+.kv { color: var(--nc-text-2); font-variant-numeric: tabular-nums; }
+.kv b { color: var(--nc-text); }
+
+/* ======================= 6. 侧栏表单 ================================= */
+
+/* 原问题：输入类控件 #11141a 与侧栏底几乎同色，看不出是输入框 → sunken 下沉一档 + 发丝线 */
+textarea.share,
+.tt input[type=text],
+.tt select,
+.dsp select {
+  background: var(--nc-sunken);
+  color: var(--nc-text);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+}
+textarea.share { border-radius: var(--nc-r-md); }
+
+/* 原问题：焦点只有浏览器默认描边（且被深色底吃掉） → 冰蓝边 + 3px 冰蓝雾做焦点环 */
+textarea.share:focus,
+.tt input[type=text]:focus,
+.tt select:focus,
+.dsp select:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+  box-shadow: 0 0 0 3px var(--nc-ice-wash);
+}
+/* 占位符比正文暗一档，避免和已输入内容混淆 */
+textarea.share::placeholder,
+.tt input[type=text]::placeholder { color: var(--nc-text-3); }
+
+/* 原问题：复选框是浏览器原生亮蓝方块，筛选面板里 6 个并排成了全屏最跳的颜色 → 收进冰蓝 */
+label.chk input[type=checkbox] { accent-color: var(--nc-ice); }
+
+/* 原问题：数字框是原生控件，在抬起卡片里像挖了几个纯黑空洞 → 与其他输入框同层：sunken 下沉；
+   外层标签已经有 1px 边框，所以输入框自己不画边（用透明边框占位，避免双框显得嘈杂） */
+#sidebar label.chk input[type=number],
+#sidebar .mp-row input,
+#sidebar .mp-row select {
+  background: var(--nc-sunken);
+  color: var(--nc-text);
+  border: 1px solid transparent;
+  border-radius: var(--nc-r-xs);
+}
+#sidebar label.chk input[type=number]:focus,
+#sidebar .mp-row input:focus,
+#sidebar .mp-row select:focus {
+  outline: none;
+  border-color: var(--nc-ice-line);
+}
+
+/* 原问题：执行顺序的标题与说明同为 text，说明文字反而抢眼 → 标题保持正文，说明降为次要 */
+.dsp h3 { color: var(--nc-text); }
+.dsp .dsp-note,
+.dsp .dsp-planner { color: var(--nc-text-2); }
+/* 原问题：序号 #8fa0bd 是裸蓝灰、字宽不等 → 次要色 + 等宽数位（11px 不用三级灰） */
+.dsp .dsp-item .ord { color: var(--nc-text-2); font-variant-numeric: tabular-nums; }
+/* 原问题：排序按钮 #232936 + 裸灰边，hover 直接刷纯白字 → 统一到次级按钮族 */
+.dsp .dsp-item button {
+  background: var(--nc-raised);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+  transition: color var(--nc-t-fast) var(--nc-ease), border-color var(--nc-t-fast) var(--nc-ease);
+}
+.dsp .dsp-item button:hover:not(:disabled) { color: var(--nc-text); border-color: var(--nc-ice-line); }
+.dsp .dsp-item button:disabled { opacity: .3; }
+
+/* 原问题：行内 code 用 #1b2230 贴在 raised 上，脏 → 下沉一档，和输入框同一层 */
+.dsp .dsp-note code { background: var(--nc-sunken); color: var(--nc-text); border-radius: var(--nc-r-xs); }
+
+/* 原问题：侧栏 chip 用 --muted + 裸灰边，10px 小字太暗 → 只修侧栏内的 chip，不动消息头里的 chip */
+#sidebar .chip { color: var(--nc-text-2); border-color: var(--nc-line); }
+
+/* ========================== 7. 状态栏 ================================ */
+
+/* 原问题：状态栏 --bar 与侧栏同明度，整条像悬浮的灰带 → canvas（比侧栏深一档）+ 顶部发丝线 */
+#status { background: var(--nc-canvas); border-top-color: var(--nc-line); color: var(--nc-text-2); }
+/* 原问题：hover 纯白过于突然 → 正文色即可 */
+#status .st:hover { color: var(--nc-text); }
+
+/* 原问题：三个圆点分别是 #22c55e / #ef4444 / #f59e0b（三套来源） → ok / danger / gold */
+#status .st.dot-green::before { color: var(--nc-ok); }
+#status .st.dot-red::before { color: var(--nc-danger); }
+#status .st.dot-amber::before { color: var(--nc-gold); }
+
+/* 原问题：off 态 opacity .55 叠在 11px 文字上已经读不清 → 改用禁用色，透明度只轻轻收一点 */
+#status .st.off { color: var(--nc-text-4); opacity: .85; }
+
+/* ======================== 8. 拖拽遮罩 ================================ */
+
+/* 原问题：遮罩 rgba(12,14,18,.72) 带蓝味，叠在冷暖混合的背景上偏脏 → 纯黑压暗，只负责挡视线 */
+#drop { background: var(--nc-scrim-2); }
+
+/* 原问题：三块图标 #8fe3d5 / #8fb6f7 / #8fb6f7 是两套亮色，和界面无关 → 冰蓝三阶成一组，
+   只有最前面的那块用满亮，避免整簇都发白 */
+.dz-icon { color: var(--nc-ice-ink); border-radius: var(--nc-r-lg); }
+.dz-x { background: var(--nc-ice-lo); }
+.dz-doc { background: var(--nc-ice-lo); }
+.dz-img { background: var(--nc-ice); box-shadow: var(--nc-shadow-2); }
+/* 原问题：图标描边 #0b2b3a 是另一套深蓝 → 与底色上的深墨字同色 */
+.dz-icon svg { stroke: var(--nc-ice-ink); }
+
+/* 原问题：标题纯白无层级，副标题 #9aa4b8 是散装灰 → 标题正文色、副标题次要色 */
+.dz-title { color: var(--nc-text); }
+.dz-sub { color: var(--nc-text-2); }
+
+/* =====================================================================
+   验收修正（一致性审计 §4.1 交回本文件的 5 条 + 2 条自查）
+   一律同特异度、写在最后，靠加载顺序生效，不动原作者结构。
+   ===================================================================== */
+
+/* 审计 P0：`#btnShare`「保存公告」没有任何主题规则命中，走浏览器默认
+   → 原生灰底 + 2px 白边 + 0 圆角，是侧栏里唯一的系统控件。归入次级按钮族。 */
+#btnShare {
+  background: var(--nc-sunken);
+  color: var(--nc-text-2);
+  border-color: var(--nc-line-2);
+  border-radius: var(--nc-r-sm);
+}
+#btnShare:hover { color: var(--nc-text); border-color: var(--nc-line-3); }
+
+/* 审计 P1：成员卡里的「单发 / 设主代理 / 移除」用 raised 叠在 raised 卡片上，
+   按钮和卡片同色，读起来像三段文字而不是三个按钮 → 下沉一格到 sunken。 */
+.agent button,
+.agent label.chk,
+.box button,
+label.chk { background: var(--nc-sunken); }
+
+/* 审计 P1：`.box` 用 line-2、`.msg` / `.wb-card` 用 line，同一级容器两种边线 → 收到 line。 */
+.box { border-color: var(--nc-line); }
+
+/* 审计 P1：`#status .st.off` 是可点的开关，却压到 2.86:1 —— 低于 3:1，等于看不见。
+   禁用色只该给真禁用，这里改三级灰并撤掉额外透明度。 */
+#status .st.off { color: var(--nc-text-3); opacity: 1; }
+
+/* 审计 P1：`.dot` 空闲态用 text-4（2.98:1），三个状态点里有一个隐形 → 三级灰。 */
+.dot { background: var(--nc-text-3); }
